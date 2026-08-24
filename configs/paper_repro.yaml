@@ -1,0 +1,37 @@
+# 论文功能复现配置：父版图级别固定 6/2/2 切分，避免任何 clip 跨集合泄漏。
+run:
+  seed: 42
+  output_root: runs
+  database: runs/opc_agent.sqlite3
+data:
+  openilt_dir: third_party/OpenILT
+  iccad13_dir: third_party/OpenILT/benchmark/ICCAD2013
+  train_parents: [M1_test1, M1_test2, M1_test3, M1_test4, M1_test5, M1_test6]
+  validation_parents: [M1_test7, M1_test8]
+  test_parents: [M1_test9, M1_test10]
+openilt:
+  commit: dabb97c6ca3dfd159362e48273c436444c77353b
+  timeout_seconds: 7200
+oracle:
+  displacement_nm_limit: 40
+  reward_weights: {l2: 1.0, epe: 100.0, pvb: 1.0}
+  seeds: [0, 1, 2]
+  simulator: simple
+  lithography_config: config/lithosimple.txt
+  openilt_scale: 1
+  learning_rate: 0.0003
+  smoke_timesteps: 256
+  total_timesteps: 10000
+qwen:
+  base_url: https://api.siliconflow.cn/v1
+  model: Qwen/Qwen3.6-35B-A3B
+  macro_f1_floor: 0.80
+
+workflow:
+  candidate_manifest: data/manifests/oracle_smoke.json
+  oracle_candidate_dataset: data/processed/oracle_smoke.npz
+  oracle_candidate_index: data/processed/candidates_v2/candidate-index.json
+  point_training_dataset: data/processed/point_training_v2.json
+decision_tree:
+  max_depth: null
+

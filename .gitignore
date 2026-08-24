@@ -1,0 +1,12 @@
+# 本文件定义 OPC Agent 的本地忽略规则，避免实验产物、凭据和第三方源码进入版本控制。
+.venv/
+__pycache__/
+.pytest_cache/
+*.py[cod]
+.env
+.env.*
+runs/
+data/
+outputs/
+third_party/
+reports/*.json

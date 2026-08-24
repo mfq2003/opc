@@ -1,0 +1,13 @@
+# 24GB 云端资源配置：此文件记录预期资源，不会自动变更宿主机或 GPU 驱动。
+environment:
+  os: Ubuntu 22.04
+  python: "3.8"
+  pytorch: 2.0.1+cu118
+  cuda: "11.8"
+  gpu_memory_gb_min: 24
+  ram_gb_min: 32
+  disk_gb_min: 80
+openilt:
+  repository: https://github.com/OpenOPC/OpenILT.git
+  commit: dabb97c6ca3dfd159362e48273c436444c77353b
+
