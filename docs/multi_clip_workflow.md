@@ -1,4 +1,8 @@
-# 多点、多父版图 Oracle 工作流
+# 历史多点、单步候选 Oracle 工作流
+
+> 本文仅用于复核旧 `legacy-candidate-point-v1` 工件。当前默认配置已经切换为
+> `simpleopc-multistep-v3`，下文带 `--candidate-index` 的训练命令会被拒绝，不能用于生成新的
+> PPO 教师或决策树标签。当前云端执行方式见 `docs/workflow_commands.md`。
 
 本文记录从已完成的单点 GPU 冒烟扩展到多 clip 候选、独立精算缓存和合并训练集的命令。命令默认在
 `~/autodl-tmp/opc_agent` 执行，不记录凭据，也不会自动启动十图长任务。

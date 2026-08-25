@@ -88,7 +88,7 @@ def prepare_data(config: Dict[str, Any], identifier: str, root: Path, store: Exp
 
 
 def baseline(config: Dict[str, Any], identifier: str, root: Path, store: ExperimentStore) -> None:
-    """运行固定提交的上游 SimpleILT，并将未解析原始日志存入运行目录。"""
+    """运行固定提交的上游 SimpleOPC，并将未解析原始日志存入运行目录。"""
     backend = config["openilt"]
     engine = OpenILTEngine(Path(config["data"]["openilt_dir"]), backend["commit"], int(backend["timeout_seconds"]))
     output = engine.optimize(Path(config["data"]["iccad13_dir"]))
@@ -126,7 +126,10 @@ def main(argv: list[str] | None = None) -> int:
     oracle_parser.add_argument("--smoke", action="store_true", help="只跑首个种子的少量 CUDA 步数")
     oracle_parser.add_argument(
         "--candidate-index", type=Path,
-        help="可选多 clip 候选索引；与 --smoke 合用时执行所有索引 clip 的小步数试跑",
+        help=(
+            "仅供 legacy-candidate-point-v1 历史单步管线使用；"
+            "当前 simpleopc-multistep-v3 主线会明确拒绝该参数"
+        ),
     )
     report_parser = subparsers.add_parser("report")
     report_parser.add_argument("--run-id", required=True)

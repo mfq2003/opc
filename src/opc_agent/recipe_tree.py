@@ -17,7 +17,7 @@ from pydantic import BaseModel, Field, validator
 
 
 
-from .features import FEATURE_NAMES
+from .features import FEATURE_NAMES, feature_names_for_version
 from .metrics import DISPLACEMENT_CLASSES_NM
 from .models import Recipe, RecipeAction, TaskType
 
@@ -37,6 +37,9 @@ class PointTrainingRow(BaseModel):
     loss_margin: Optional[float] = Field(default=None, ge=0)
     ambiguous: bool = False
     candidate_collision: Optional[bool] = None
+    ppo_displacement_nm: Optional[float] = Field(default=None, ge=-40, le=40)
+    quantization_error_nm: Optional[float] = None
+    ppo_model_sha256: Optional[str] = Field(default=None, min_length=64, max_length=64)
 
     @validator("split")
     def _valid_split(cls, value: str) -> str:
@@ -54,9 +57,9 @@ class PointTrainingRow(BaseModel):
 
     @validator("features")
     def _valid_features(cls, value: Dict[str, float]) -> Dict[str, float]:
-        if set(value) != set(FEATURE_NAMES):
-            raise ValueError(f"features 必须恰好包含 {list(FEATURE_NAMES)}")
-        if not np.isfinite([value[name] for name in FEATURE_NAMES]).all():
+        if not value:
+            raise ValueError("features 不能为空")
+        if not np.isfinite(list(value.values())).all():
             raise ValueError("features 含 NaN 或无穷值")
         return value
 
@@ -67,6 +70,8 @@ class PointTrainingDataset(BaseModel):
     schema_version: str = "1.0"
     feature_version: str = "geometry-v1"
     label_version: str = "oracle-weighted-loss-v1"
+    ppo_quality_status: Optional[str] = None
+    ppo_quality_report_sha256: Optional[str] = None
     rows: List[PointTrainingRow]
 
 
@@ -115,7 +120,12 @@ def validate_training_dataset(dataset: PointTrainingDataset) -> None:
     if len(sample_ids) != len(set(sample_ids)):
         raise ValueError("点级训练数据存在重复 sample_id")
     parent_splits: Dict[str, str] = {}
+    expected_features = set(feature_names_for_version(dataset.feature_version))
     for row in dataset.rows:
+        if set(row.features) != expected_features:
+            raise ValueError(
+                f"{dataset.feature_version} features 必须恰好包含 {sorted(expected_features)}"
+            )
         previous = parent_splits.setdefault(row.parent_layout, row.split)
         if previous != row.split:
             raise ValueError(f"父版图 {row.parent_layout} 跨数据集泄漏")
@@ -128,9 +138,9 @@ def _rows_hash(rows: Sequence[PointTrainingRow]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _matrix(rows: Sequence[PointTrainingRow]) -> Tuple[np.ndarray, np.ndarray]:
+def _matrix(rows: Sequence[PointTrainingRow], feature_names: Sequence[str]) -> Tuple[np.ndarray, np.ndarray]:
     """按固定特征顺序转换为 sklearn 输入矩阵和标签。"""
-    x = np.asarray([[row.features[name] for name in FEATURE_NAMES] for row in rows], dtype=np.float64)
+    x = np.asarray([[row.features[name] for name in feature_names] for row in rows], dtype=np.float64)
     y = np.asarray([row.displacement_class for row in rows], dtype=np.int64)
     return x, y
 
@@ -142,6 +152,8 @@ def _export_tree(
     split_counts: Dict[str, int],
     macro_f1: float,
     seed: int,
+    feature_version: str,
+    feature_names: Sequence[str],
 ) -> TreeArtifact:
     """把 sklearn 内部数组转成不依赖 pickle 的版本化节点列表。"""
     tree = classifier.tree_
@@ -157,8 +169,9 @@ def _export_tree(
         for index in range(tree.node_count)
     ]
     return TreeArtifact(
+        feature_version=feature_version,
         task_type=task_type,
-        feature_names=list(FEATURE_NAMES),
+        feature_names=list(feature_names),
         classes=[int(value) for value in classifier.classes_],
         nodes=nodes,
         train_rows=split_counts["train"],
@@ -184,12 +197,13 @@ def train_task_tree(
     from sklearn.tree import DecisionTreeClassifier
 
     validate_training_dataset(dataset)
+    feature_names = feature_names_for_version(dataset.feature_version)
     rows = [row for row in dataset.rows if row.task_type == task_type]
     split_rows = {split: [row for row in rows if row.split == split] for split in ("train", "validation", "test")}
     if not split_rows["train"] or not split_rows["test"]:
         raise ValueError(f"{task_type.value} 必须同时具有 train 和 test 数据")
-    train_x, train_y = _matrix(split_rows["train"])
-    test_x, test_y = _matrix(split_rows["test"])
+    train_x, train_y = _matrix(split_rows["train"], feature_names)
+    test_x, test_y = _matrix(split_rows["test"], feature_names)
     classifier = DecisionTreeClassifier(
         random_state=int(seed),
         max_depth=max_depth,
@@ -199,7 +213,10 @@ def train_task_tree(
     predictions = classifier.predict(test_x)
     macro_f1 = float(f1_score(test_y, predictions, labels=list(range(9)), average="macro", zero_division=0))
     counts = {split: len(values) for split, values in split_rows.items()}
-    return _export_tree(classifier, task_type, rows, counts, macro_f1, int(seed))
+    return _export_tree(
+        classifier, task_type, rows, counts, macro_f1, int(seed),
+        dataset.feature_version, feature_names,
+    )
 
 
 def predict_tree(artifact: TreeArtifact, features: Dict[str, float]) -> Tuple[int, float]:

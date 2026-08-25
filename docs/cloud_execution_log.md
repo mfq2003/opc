@@ -197,3 +197,17 @@ python -m opc_agent.oracle_batch_labels \
 - 评估判断：seed 2 的准确率最高、遗憾最低，seed 1 的 macro-F1 最高；最佳 macro-F1 仍只有 `0.180078`，且种子结果差异明显，不能据此声称稳定九分类策略。原日志的高熵、低 KL 与低 explained variance 警告仍有效，但不再写成“尚未评估”。
 - 科学边界：模型按 clip 独立训练并在同一 clip 上评估，因此这不是跨版图泛化；该结果只覆盖 v3 EPE，FRAG 嵌套分段动作、共享跨版图策略、双树、跨版图闭环和完整论文复现仍未完成。
 - 后续路线：保留本次 run 与 12933 个指标作为只读证据，优先从现有缓存构造只在 6 个 train 父版图训练的共享策略，用 validation 选型、test 最终评估；该步骤不需要重新执行全部 OpenILT 候选。
+
+## 已完成：SimpleOPC 多步 PPO v3 云端冒烟与单模型诊断
+
+- 环境：`simpleopc-multistep-v3`；损失版本为 `paper-weighted-sum-initial-normalized-v1`，训练和验收统一使用 `L2+100×EPE+PVB` 后整体除以初始加权和。
+- OpenILT：固定提交 `dabb97c6ca3dfd159362e48273c436444c77353b`，训练前后 tracked diff 退出码均为 0。
+- 云端回归：v3 配置、公式和完整 pytest 均达到 100%，未观察到测试失败。
+- 256 timestep 冒烟：run `20260825T030855Z-train-oracle-7363bc90`；PPO 每一步均劣于初始状态，历史最佳回退到 step 0 和 `0nm×242`；该结果只证明链路可执行。
+- 10000 timestep 诊断：run `20260825T031554Z-train-oracle-ff3b8ee9`；实际 10000 timestep，耗时 `1787.6209s`，模型 ZIP、Recipe、metadata、heuristic 和 stage 均存在且通过 JSON/模型哈希检查。
+- PPO 最佳：step 1，`L2/EPE/PVB=96275/58/44355`，原始加权损失 `146430`，归一化损失 `0.85803185`，相对初始改善 `14.1968%`。
+- 启发式最佳：step 2，`L2/EPE/PVB=64890/25/78522`，原始加权损失 `145912`，归一化损失 `0.85499654`。
+- 差距：PPO 比启发式高 `518`，相对高 `0.3550%`；未通过配置中“不差于启发式”的严格门槛。
+- 动作：`-10/0/+10nm=73/79/90`，最大类别占比 `0.3719`，没有动作坍缩。三类是因为最佳点在第一步，不代表九个位移类别不可达。
+- 科学边界：当前是 train split 的单 clip、单 seed smoke 模式，不能运行正式 quality accepted 判定，也不能据此训练决策树。
+- 汇报材料与 GPU 迁移分析：`docs/simpleopc_v3_m1_test1_diagnostic_20260825.md`。

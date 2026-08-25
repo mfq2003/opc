@@ -30,6 +30,14 @@ def train_oracle_stage(
     candidate_index: Path | None = None,
 ) -> None:
     """在 CUDA 上训练 PPO；支持单 clip 冒烟或按索引逐 clip、逐种子运行。"""
+    environment = str(config.get("oracle", {}).get("environment", "legacy-candidate-point-v1"))
+    if environment == "simpleopc-multistep-v3":
+        if candidate_index is not None:
+            raise ValueError("SimpleOPC 多步 PPO 直接读取 GLP，不接受旧 candidate-index")
+        _train_simpleopc_stage(config, root, smoke=smoke)
+        return
+    if environment != "legacy-candidate-point-v1":
+        raise ValueError(f"未知 oracle.environment：{environment}")
     from .oracle_runner import (
         CandidatePointEnv, OpenILTCandidateEvaluator, complete_metric_cache,
         load_candidate_point_set, train_ppo,
@@ -108,12 +116,146 @@ def train_oracle_stage(
         })
     (root / "stage-result.json").write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
 
+
+def _train_simpleopc_stage(config: Dict[str, Any], root: Path, smoke: bool) -> None:
+    """逐父版图、逐种子训练多步 SimpleOPC PPO，并把所有产物写入本项目 runs。"""
+    from .simpleopc import OpenILTSimpleOPCBackend, SimpleOPCMultiStepEnv
+    from .simpleopc_runner import run_simpleopc_heuristic, train_simpleopc_ppo
+
+    data = config["data"]
+    backend_config = config["openilt"]
+    oracle = config["oracle"]
+    simpleopc = config.get("simpleopc")
+    if not isinstance(simpleopc, dict):
+        raise ValueError("simpleopc-multistep-v3 需要 simpleopc 配置段")
+    split_parents = {
+        "train": list(data["train_parents"]),
+        "validation": list(data["validation_parents"]),
+        "test": list(data["test_parents"]),
+    }
+    jobs = [
+        (str(parent), split)
+        for split in ("train", "validation", "test")
+        for parent in split_parents[split]
+    ]
+    if smoke:
+        jobs = jobs[:1]
+    seeds = [int(oracle["seeds"][0])] if smoke else [int(value) for value in oracle["seeds"]]
+    timesteps = int(oracle["smoke_timesteps"] if smoke else oracle["total_timesteps"])
+    from .metrics import DISPLACEMENT_CLASSES_NM, SIMPLEOPC_LOSS_VERSION
+
+    displacement_limit = float(oracle["displacement_nm_limit"])
+    if displacement_limit != 40.0:
+        raise ValueError("论文公开的 PPO 位移范围要求 oracle.displacement_nm_limit=40")
+    configured_classes = tuple(int(value) for value in simpleopc["displacement_classes_nm"])
+    if configured_classes != DISPLACEMENT_CLASSES_NM:
+        raise ValueError(
+            "simpleopc.displacement_classes_nm 必须为 "
+            f"{list(DISPLACEMENT_CLASSES_NM)}"
+        )
+    step_sizes = [float(value) for value in simpleopc["step_sizes_nm"]]
+    if step_sizes != [10.0, 10.0, 10.0, 10.0]:
+        raise ValueError(
+            "paper_repro 的等距九分类适配要求 step_sizes_nm=[10, 10, 10, 10]"
+        )
+    image_size = tuple(int(value) for value in simpleopc.get("image_size", [2048, 2048]))
+    if len(image_size) != 2:
+        raise ValueError("simpleopc.image_size 必须包含 width、height 两个整数")
+    clip_results = []
+    for clip_id, split in jobs:
+        layout_path = Path(data["iccad13_dir"]) / f"{clip_id}.glp"
+        clip_root = root / "clips" / clip_id
+        clip_root.mkdir(parents=True, exist_ok=True)
+        backend = OpenILTSimpleOPCBackend(
+            openilt_dir=Path(data["openilt_dir"]),
+            expected_commit=backend_config["commit"],
+            layout_path=layout_path,
+            lithography_config=Path(oracle["lithography_config"]),
+            simulator=oracle["simulator"],
+            image_size=(image_size[0], image_size[1]),
+            openilt_scale=int(oracle.get("openilt_scale", 1)),
+            nm_per_coordinate=float(simpleopc.get("nm_per_coordinate", 1.0)),
+            len_corner_nm=float(simpleopc["len_corner_nm"]),
+            len_uniform_nm=float(simpleopc["len_uniform_nm"]),
+            epe_sample_distance_nm=float(simpleopc["epe_sample_distance_nm"]),
+            threshold=float(simpleopc.get("threshold", 0.5)),
+        )
+
+        def make_env() -> SimpleOPCMultiStepEnv:
+            """为相同只读后端建立全新 episode 状态。"""
+            return SimpleOPCMultiStepEnv(
+                backend=backend,
+                reward_weights=dict(oracle["reward_weights"]),
+                step_sizes_nm=step_sizes,
+                displacement_limit_nm=displacement_limit,
+                metric_epsilon=float(simpleopc.get("metric_epsilon", 1.0)),
+            )
+
+        heuristic = run_simpleopc_heuristic(make_env(), seed=0)
+        heuristic_path = clip_root / "simpleopc-heuristic.json"
+        heuristic_path.write_text(
+            json.dumps(heuristic, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        outputs = []
+        recipes = []
+        for seed in seeds:
+            output, recipe = train_simpleopc_ppo(
+                env=make_env(),
+                output_path=root / "models" / f"{clip_id}-seed-{seed}",
+                total_timesteps=timesteps,
+                seed=seed,
+                learning_rate=float(oracle["learning_rate"]),
+            )
+            outputs.append(str(output))
+            recipes.append(str(recipe))
+        clip_results.append({
+            "clip_id": clip_id,
+            "split": split,
+            "layout_path": str(layout_path),
+            "layout_sha256": backend.layout_sha256,
+            "segment_count": len(backend.segments),
+            "heuristic_path": str(heuristic_path),
+            "models": outputs,
+            "ppo_recipes": recipes,
+        })
+    result = {
+        "mode": "smoke" if smoke else "full",
+        "environment": "simpleopc-multistep-v3",
+        "loss_version": SIMPLEOPC_LOSS_VERSION,
+        "openilt_mutation": "none",
+        "seeds": seeds,
+        "timesteps_per_seed": timesteps,
+        "episode_step_sizes_nm": step_sizes,
+        "displacement_classes_nm": list(DISPLACEMENT_CLASSES_NM),
+        "paper_displacement_range_nm": [-displacement_limit, displacement_limit],
+        "clips": clip_results,
+        "decision_tree_labels": "ppo_recipe_only",
+        "frag_status": "not_implemented_requires_nested_resegmentation",
+    }
+    (root / "stage-result.json").write_text(
+        json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
 def build_recipe_stage(config: Dict[str, Any], root: Path) -> None:
     """从版本化点级真值训练 EPE/FRAG 双树并导出确定性 Recipe。"""
     from .recipe_tree import PointTrainingDataset, train_both_trees
 
     dataset_path = _required_path(config, "point_training_dataset")
     dataset = PointTrainingDataset.parse_obj(json.loads(dataset_path.read_text(encoding="utf-8")))
+    if not dataset.label_version.startswith("ppo-simpleopc-"):
+        raise RuntimeError(
+            "正式决策树只接受通过质量门槛的 PPO SimpleOPC Recipe 标签；"
+            f"当前 label_version={dataset.label_version}"
+        )
+    if dataset.ppo_quality_status != "accepted":
+        raise RuntimeError("PPO SimpleOPC 质量报告未 accepted，禁止训练正式决策树")
+    if not dataset.ppo_quality_report_sha256 or len(dataset.ppo_quality_report_sha256) != 64:
+        raise RuntimeError("PPO 决策树标签缺少 64 位质量报告哈希")
+    tasks = {row.task_type.value for row in dataset.rows}
+    if tasks != {"EPE", "FRAG"}:
+        raise RuntimeError("正式决策树必须同时具有 accepted PPO 生成的 EPE 与 FRAG 标签")
     tree_config = config.get("decision_tree", {})
     max_depth = tree_config.get("max_depth")
     result = train_both_trees(

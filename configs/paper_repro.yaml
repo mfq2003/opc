@@ -13,7 +13,9 @@ openilt:
   commit: dabb97c6ca3dfd159362e48273c436444c77353b
   timeout_seconds: 7200
 oracle:
+  environment: simpleopc-multistep-v3
   displacement_nm_limit: 40
+  # 原始加权和 L2 + 100*EPE + PVB 整体除以初始加权和；训练与质量验收共用同一公式。
   reward_weights: {l2: 1.0, epe: 100.0, pvb: 1.0}
   seeds: [0, 1, 2]
   simulator: simple
@@ -22,6 +24,24 @@ oracle:
   learning_rate: 0.0003
   smoke_timesteps: 256
   total_timesteps: 10000
+simpleopc:
+  # 论文只公开 ±40nm 动作范围和最终采用 9 类，未公开 PPO 步长、迭代数或分类边界。
+  # 本适配用等距 10nm 代表值和 4 个 10nm 增量，使九个代表值都能精确到达；不得称为论文原始超参数。
+  image_size: [2048, 2048]
+  nm_per_coordinate: 1.0
+  len_corner_nm: 16
+  len_uniform_nm: 32
+  epe_sample_distance_nm: 16
+  displacement_classes_nm: [-40, -30, -20, -10, 0, 10, 20, 30, 40]
+  step_sizes_nm: [10, 10, 10, 10]
+  threshold: 0.5
+  metric_epsilon: 1.0
+ppo_acceptance:
+  # validation 上的最佳 PPO seed 必须不差于启发式，并至少比初始掩模改善 1%。
+  max_relative_loss_vs_heuristic: 0.0
+  min_relative_improvement_vs_initial: 0.01
+  max_seed_loss_cv: 0.20
+  max_single_action_fraction: 0.95
 qwen:
   base_url: https://api.siliconflow.cn/v1
   model: Qwen/Qwen3.6-35B-A3B
@@ -31,7 +51,8 @@ workflow:
   candidate_manifest: data/manifests/oracle_smoke.json
   oracle_candidate_dataset: data/processed/oracle_smoke.npz
   oracle_candidate_index: data/processed/candidates_v2/candidate-index.json
-  point_training_dataset: data/processed/point_training_v2.json
+  # 只能由通过质量门槛的 PPO Recipe 转换生成；旧九动作 Oracle 标签会被 build-recipe 拒绝。
+  point_training_dataset: data/processed/ppo_simpleopc_point_training.json
 decision_tree:
   max_depth: null
 

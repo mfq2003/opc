@@ -6,7 +6,12 @@
 import numpy as np
 import pytest
 
-from opc_agent.metrics import compute_binary_metrics, dequantize_displacement, quantize_displacement
+from opc_agent.metrics import (
+    compute_binary_metrics,
+    dequantize_displacement,
+    quantize_displacement,
+    weighted_opc_loss,
+)
 
 
 def test_binary_metrics_counts_nominal_and_process_window_errors():
@@ -25,3 +30,9 @@ def test_displacement_quantization(value, expected):
     assert quantize_displacement(value) == expected
     assert -40 <= dequantize_displacement(expected) <= 40
 
+
+def test_weighted_opc_loss_preserves_paper_coefficients_before_single_scale():
+    """共享损失必须直接计算 L2+100*EPE+PVB，不能分别按指标初值改写相对权重。"""
+    metrics = {"l2": 116184, "epe": 86, "pvb": 45874}
+    weights = {"l2": 1, "epe": 100, "pvb": 1}
+    assert weighted_opc_loss(metrics, weights) == 170658.0

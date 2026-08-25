@@ -11,6 +11,27 @@ import numpy as np
 
 
 FEATURE_NAMES = ("fill_ratio", "horizontal_edge_density", "vertical_edge_density", "corner_density", "bbox_aspect")
+SIMPLEOPC_SEGMENT_FEATURE_NAMES = (
+    "midpoint_x_nm",
+    "midpoint_y_nm",
+    "segment_length_nm",
+    "is_horizontal",
+    "normal_x",
+    "normal_y",
+    "initial_epe_sign",
+)
+
+
+def feature_names_for_version(feature_version: str):
+    """返回版本化决策树字段，拒绝把旧全图特征和新边段特征静默混用。"""
+    versions = {
+        "geometry-v1": FEATURE_NAMES,
+        "simpleopc-segment-v1": SIMPLEOPC_SEGMENT_FEATURE_NAMES,
+    }
+    try:
+        return versions[str(feature_version)]
+    except KeyError as exc:
+        raise ValueError(f"未知 feature_version：{feature_version}") from exc
 
 
 def extract_geometry_features(image: np.ndarray) -> Dict[str, float]:
@@ -52,4 +73,3 @@ def is_out_of_distribution(vector: Sequence[float], training_vectors: Iterable[S
     mad = np.median(np.abs(train - center), axis=0)
     scale = np.where(mad < 1e-12, 1.0, 1.4826 * mad)
     return bool(np.any(np.abs((value - center) / scale) > zscore_limit))
-
