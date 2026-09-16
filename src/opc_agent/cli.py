@@ -10,6 +10,7 @@ import hashlib
 import json
 import platform
 import sys
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -19,6 +20,7 @@ import yaml
 
 from .engine import OpenILTEngine
 from .models import LayoutClip
+from .official_simpleopc_results import archive_official_simpleopc_results
 from .storage import ExperimentStore
 from .workflow import build_recipe_stage, run_loop_stage, train_oracle_stage
 
@@ -88,12 +90,204 @@ def prepare_data(config: Dict[str, Any], identifier: str, root: Path, store: Exp
 
 
 def baseline(config: Dict[str, Any], identifier: str, root: Path, store: ExperimentStore) -> None:
-    """运行固定提交的上游 SimpleOPC，并将未解析原始日志存入运行目录。"""
+    """在隔离目录原样运行固定提交的上游 SimpleOPC，并归档十图结果。"""
     backend = config["openilt"]
     engine = OpenILTEngine(Path(config["data"]["openilt_dir"]), backend["commit"], int(backend["timeout_seconds"]))
-    output = engine.optimize(Path(config["data"]["iccad13_dir"]))
+    execution_root = root / "official-simpleopc"
+    started = time.monotonic()
+    output = engine.optimize(Path(config["data"]["iccad13_dir"]), output_dir=execution_root)
+    elapsed = time.monotonic() - started
     (root / "openilt-baseline.log").write_text(output, encoding="utf-8")
-    (root / "openilt-revision.txt").write_text(engine.revision() + "\n", encoding="utf-8")
+    revision = engine.revision()
+    (root / "openilt-revision.txt").write_text(revision + "\n", encoding="utf-8")
+    archive_official_simpleopc_results(
+        root,
+        execution_root,
+        revision,
+        dict(config["oracle"]["reward_weights"]),
+        elapsed,
+    )
+
+
+def v2_preflight(config: Dict[str, Any], root: Path, layout_parent: str) -> None:
+    """运行 v2 单图真实 OpenILT 灵敏度预检并保存 diagnostic-only 工件。"""
+    from .recipe_v2_openilt import run_v2_openilt_preflight
+
+    result = run_v2_openilt_preflight(config, layout_parent=layout_parent)
+    artifact = root / "recipe-v2-preflight.json"
+    artifact.write_text(
+        json.dumps(result, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    print(json.dumps({
+        "artifact": str(artifact),
+        "status": result["status"],
+        "sensitivity_summary": result["sensitivity_summary"],
+        "all_action_valid_probes_nm": [
+            item["probe_distance_nm"]
+            for item in result["geometry_scan"]
+            if item["all_actions_valid_for_all_points"]
+        ],
+        "training_enabled": result["training_enabled"],
+    }, ensure_ascii=False, indent=2))
+
+
+def v2_episode_smoke(config: Dict[str, Any], root: Path, layout_parent: str) -> None:
+    """运行 128 observation 完整 episode smoke，并保存 PPO 输入汇报样例。"""
+    from .recipe_v2_openilt import run_v2_openilt_episode_smoke
+
+    result = run_v2_openilt_episode_smoke(
+        config, artifact_root=root, layout_parent=layout_parent
+    )
+    artifact = root / "recipe-v2-episode-smoke.json"
+    artifact.write_text(
+        json.dumps(result, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    print(json.dumps({
+        "artifact": str(artifact),
+        "status": result["status"],
+        "layout_parent": result["layout_parent"],
+        "patch_size": result["patch_size"],
+        "variant_count": len(result["variants"]),
+        "solver_calls": result["solver_calls"],
+        "cross_protocol_final_equal": result["cross_protocol_final_equal"],
+        "repeat_baseline_equal": result["repeat_baseline_equal"],
+        "ppo_input_examples": result["ppo_input_examples"]["manifest"],
+        "ppo_input_example_count": result["ppo_input_examples"]["saved_example_count"],
+        "pass": result["pass"],
+        "training_enabled": result["training_enabled"],
+    }, ensure_ascii=False, indent=2))
+
+
+def v2_input_examples(config: Dict[str, Any], root: Path, layout_parent: str) -> None:
+    """用一次冻结基线求解导出 128 observation 的 PPO 输入汇报样例。"""
+    from .recipe_v2_openilt import run_v2_openilt_input_examples
+
+    result = run_v2_openilt_input_examples(
+        config, artifact_root=root, layout_parent=layout_parent
+    )
+    artifact = root / "recipe-v2-input-examples.json"
+    artifact.write_text(
+        json.dumps(result, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    print(json.dumps({
+        "artifact": str(artifact),
+        "status": result["status"],
+        "layout_parent": result["layout_parent"],
+        "patch_size": result["patch_size"],
+        "point_count": result["point_count"],
+        "solver_calls": result["solver_calls"],
+        "ppo_input_examples": result["ppo_input_examples"]["manifest"],
+        "ppo_input_example_count": result["ppo_input_examples"]["saved_example_count"],
+        "training_enabled": result["training_enabled"],
+    }, ensure_ascii=False, indent=2))
+
+
+def v2_ppo_smoke(
+    config: Dict[str, Any], root: Path, layout_parent: str, protocol: str
+) -> None:
+    """运行一个独立 dense/terminal v2 PPO CUDA 数值 smoke。"""
+    from .recipe_v2_runner import run_v2_ppo_smoke
+
+    result = run_v2_ppo_smoke(
+        config,
+        artifact_root=root,
+        protocol_alias=protocol,
+        layout_parent=layout_parent,
+    )
+    artifact = root / "recipe-v2-ppo-smoke.json"
+    artifact.write_text(
+        json.dumps(result, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    print(json.dumps({
+        "artifact": str(artifact),
+        "status": result["status"],
+        "layout_parent": result["layout_parent"],
+        "training_protocol": result["training_protocol"],
+        "total_timesteps": result["training"]["total_timesteps_actual"],
+        "ppo_updates": result["training"]["numerics"]["update_count"],
+        "final_replay_equal": result["deterministic_final_replay"]["final_replay_equal"],
+        "numeric_pass": result["numeric_pass"],
+        "pass": result["pass"],
+        "accepted": result["accepted"],
+        "long_training_enabled": result["long_training_enabled"],
+    }, ensure_ascii=False, indent=2))
+
+
+def v2_ppo_pilot(
+    config: Dict[str, Any], root: Path, layout_parent: str, protocol: str
+) -> None:
+    """运行一个独立 dense/terminal v2 PPO 三次更新稳定性 pilot。"""
+    from .recipe_v2_runner import run_v2_ppo_pilot
+
+    result = run_v2_ppo_pilot(
+        config,
+        artifact_root=root,
+        protocol_alias=protocol,
+        layout_parent=layout_parent,
+    )
+    artifact = root / "recipe-v2-ppo-pilot.json"
+    artifact.write_text(
+        json.dumps(result, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    print(json.dumps({
+        "artifact": str(artifact),
+        "status": result["status"],
+        "layout_parent": result["layout_parent"],
+        "training_protocol": result["training_protocol"],
+        "rollout_count": result["rollout_count"],
+        "total_timesteps": result["training"]["total_timesteps_actual"],
+        "ppo_updates": result["training"]["numerics"]["update_count"],
+        "stability_pass": result["stability_pass"],
+        "final_replay_equal": result["deterministic_final_replay"]["final_replay_equal"],
+        "pass": result["pass"],
+        "accepted": result["accepted"],
+        "long_training_enabled": result["long_training_enabled"],
+    }, ensure_ascii=False, indent=2))
+
+
+def v2_ppo_small_train(
+    config: Dict[str, Any], root: Path, layout_parents: list[str], protocol: str
+) -> None:
+    """运行双版图单共享模型的 terminal 受控小训练。"""
+    from .recipe_v2_small_train import run_v2_ppo_small_train
+
+    result = run_v2_ppo_small_train(
+        config,
+        artifact_root=root,
+        protocol_alias=protocol,
+        layout_parents=layout_parents,
+    )
+    artifact = root / "recipe-v2-ppo-small-train.json"
+    artifact.write_text(
+        json.dumps(result, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    print(json.dumps({
+        "artifact": str(artifact),
+        "status": result["status"],
+        "layout_parents": result["layout_parents"],
+        "shared_model": result["shared_model"],
+        "training_protocol": result["training_protocol"],
+        "total_timesteps_requested": result["training"]["total_timesteps_requested"],
+        "total_timesteps_actual": result["training"]["total_timesteps_actual"],
+        "completed_update_count": result["training"]["completed_update_count"],
+        "completed_episodes_per_layout": result["training"]["completed_episodes_per_layout"],
+        "stopped_early": result["training"]["stopped_early"],
+        "ppo_input_examples": {
+            layout: details["manifest"]
+            for layout, details in result["ppo_input_examples"].items()
+        },
+        "episode_contract_equal": result["episode_contract_equal"],
+        "all_final_replays_equal": result["all_final_replays_equal"],
+        "execution_pass": result["execution_pass"],
+        "accepted": result["accepted"],
+        "long_training_enabled": result["long_training_enabled"],
+    }, ensure_ascii=False, indent=2))
 
 
 def require_prior_data(config: Dict[str, Any], command: str) -> None:
@@ -123,15 +317,73 @@ def main(argv: list[str] | None = None) -> int:
         child.add_argument("--config", type=Path, required=True)
     oracle_parser = subparsers.add_parser("train-oracle")
     oracle_parser.add_argument("--config", type=Path, required=True)
-    oracle_parser.add_argument("--smoke", action="store_true", help="只跑首个种子的少量 CUDA 步数")
+    oracle_mode = oracle_parser.add_mutually_exclusive_group()
+    oracle_mode.add_argument("--smoke", action="store_true", help="只跑首个种子的少量 CUDA 步数")
+    oracle_mode.add_argument(
+        "--preflight", action="store_true",
+        help="只构造首个 Recipe 环境、运行默认 solver 并检查 observation，不训练 PPO",
+    )
     oracle_parser.add_argument(
         "--candidate-index", type=Path,
         help=(
             "仅供 legacy-candidate-point-v1 历史单步管线使用；"
-            "当前 simpleopc-multistep-v3 主线会明确拒绝该参数"
+            "当前 simpleopc-recipe-point-v1 主线会明确拒绝该参数"
         ),
     )
+    v2_parser = subparsers.add_parser(
+        "v2-preflight",
+        help="运行单图真实 OpenILT v2 动作/probe/Golden 灵敏度预检，不训练 PPO",
+    )
+    v2_parser.add_argument("--config", type=Path, required=True)
+    v2_parser.add_argument("--layout", default="M1_test1")
+    v2_smoke_parser = subparsers.add_parser(
+        "v2-episode-smoke",
+        help="运行 128 observation 的 dense/terminal 完整 episode，不训练 PPO",
+    )
+    v2_smoke_parser.add_argument("--config", type=Path, required=True)
+    v2_smoke_parser.add_argument("--layout")
+    v2_examples_parser = subparsers.add_parser(
+        "v2-input-examples",
+        help="只求解一次基线并导出 128 observation 的五通道 PPO 输入样例",
+    )
+    v2_examples_parser.add_argument("--config", type=Path, required=True)
+    v2_examples_parser.add_argument("--layout")
+    v2_ppo_parser = subparsers.add_parser(
+        "v2-ppo-smoke",
+        help="在 M1_test4 上独立运行 dense 或 terminal 的单 rollout CUDA PPO smoke",
+    )
+    v2_ppo_parser.add_argument("--config", type=Path, required=True)
+    v2_ppo_parser.add_argument("--layout")
+    v2_ppo_parser.add_argument(
+        "--protocol", choices=("dense", "terminal"), required=True
+    )
+    v2_pilot_parser = subparsers.add_parser(
+        "v2-ppo-pilot",
+        help="在 M1_test4 上独立运行 dense 或 terminal 的三次更新稳定性 pilot",
+    )
+    v2_pilot_parser.add_argument("--config", type=Path, required=True)
+    v2_pilot_parser.add_argument("--layout")
+    v2_pilot_parser.add_argument(
+        "--protocol", choices=("dense", "terminal"), required=True
+    )
+    v2_small_train_parser = subparsers.add_parser(
+        "v2-ppo-small-train",
+        help="在 M1_test5/6 上运行一个共享 terminal PPO 模型的五次更新受控小训练",
+    )
+    v2_small_train_parser.add_argument("--config", type=Path, required=True)
+    v2_small_train_parser.add_argument(
+        "--layouts",
+        nargs=2,
+        required=True,
+        metavar=("LAYOUT_A", "LAYOUT_B"),
+        help="必须与 small_train.layout_parents 顺序一致，例如 M1_test5 M1_test6",
+    )
+    v2_small_train_parser.add_argument(
+        "--protocol", choices=("terminal",), required=True
+    )
     report_parser = subparsers.add_parser("report")
+    search_parser = subparsers.add_parser("v2-search", help="全零基线与可续跑离散坐标搜索诊断")
+    search_parser.add_argument("--config", type=Path, required=True)
     report_parser.add_argument("--run-id", required=True)
     args = parser.parse_args(argv)
     if args.command == "report":
@@ -140,12 +392,64 @@ def main(argv: list[str] | None = None) -> int:
     config = load_config(args.config)
     identifier, root, store = init_run(config, args.command)
     try:
-        if args.command == "prepare-data":
+        if args.command == "v2-search":
+            from .recipe_v2_search import run_v2_search
+
+            result = run_v2_search(config, root)
+            print(json.dumps({"artifact": str(root / "recipe-v2-search.json"),
+                              "status": result["status"], "solver_calls": result["solver_calls"],
+                              "accepted": False}, ensure_ascii=False, indent=2))
+        elif args.command == "prepare-data":
             prepare_data(config, identifier, root, store)
         elif args.command == "baseline":
             baseline(config, identifier, root, store)
         elif args.command == "train-oracle":
-            train_oracle_stage(config, root, smoke=args.smoke, candidate_index=args.candidate_index)
+            train_oracle_stage(
+                config,
+                root,
+                smoke=args.smoke,
+                candidate_index=args.candidate_index,
+                preflight=args.preflight,
+            )
+        elif args.command == "v2-preflight":
+            v2_preflight(config, root, layout_parent=args.layout)
+        elif args.command == "v2-episode-smoke":
+            layout_parent = args.layout or config.get("episode_smoke", {}).get(
+                "layout_parent", "M1_test4"
+            )
+            v2_episode_smoke(config, root, layout_parent=layout_parent)
+        elif args.command == "v2-input-examples":
+            layout_parent = args.layout or config.get("episode_smoke", {}).get(
+                "layout_parent", "M1_test4"
+            )
+            v2_input_examples(config, root, layout_parent=layout_parent)
+        elif args.command == "v2-ppo-smoke":
+            layout_parent = args.layout or config.get("training", {}).get(
+                "smoke", {}
+            ).get("layout_parent", "M1_test4")
+            v2_ppo_smoke(
+                config,
+                root,
+                layout_parent=layout_parent,
+                protocol=args.protocol,
+            )
+        elif args.command == "v2-ppo-pilot":
+            layout_parent = args.layout or config.get("training", {}).get(
+                "pilot", {}
+            ).get("layout_parent", "M1_test4")
+            v2_ppo_pilot(
+                config,
+                root,
+                layout_parent=layout_parent,
+                protocol=args.protocol,
+            )
+        elif args.command == "v2-ppo-small-train":
+            v2_ppo_small_train(
+                config,
+                root,
+                layout_parents=args.layouts,
+                protocol=args.protocol,
+            )
         elif args.command == "build-recipe":
             build_recipe_stage(config, root)
         elif args.command == "run-loop":

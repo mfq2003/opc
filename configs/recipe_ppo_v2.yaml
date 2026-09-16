@@ -1,0 +1,194 @@
+# 局部 EPE / 全局 FRAG Recipe PPO v2 的预检、smoke、pilot 与受控小训练配置。
+# 首次云端运行完成 984-step rollout 后暴露 SB3 buffer 展平兼容问题；本地已修复，等待云端重跑。
+# 双版图共享 terminal 小训练仍只允许 diagnostic-only；dense、长训练和 accepted 继续禁用。
+status: shared_terminal_small_training_rollout_shape_fix_cloud_rerun_pending_long_training_disabled
+environment: simpleopc-recipe-local-epe-global-frag-v2
+
+data:
+  openilt_dir: third_party/OpenILT
+  iccad13_dir: third_party/OpenILT/benchmark/ICCAD2013
+  train_parents: [M1_test1, M1_test2, M1_test3, M1_test4, M1_test5, M1_test6]
+  validation_parents: [M1_test7, M1_test8]
+  test_parents: [M1_test9, M1_test10]
+
+openilt:
+  commit: dabb97c6ca3dfd159362e48273c436444c77353b
+  tracked_diff_must_be_clean: true
+
+preflight:
+  # 先做纯几何全点扫描；真实 OpenILT 从基线 active、无冲突的点中按原始边/法线/角点特征抽八个，并测试四个非零动作。
+  probe_distance_candidates_nm: [16, 24, 32, 48, 56, 64]
+  sensitivity_point_limit: 8
+  sensitivity_actions_nm: [-20, -10, 10, 20]
+  # 双侧同时违规时不伪造 inner/outer 优先级；当轮保守 stay 并完整记录。
+  control_conflict_policy: both-sides-conflict-stay-v1
+
+episode_smoke:
+  layout_parent: M1_test4
+  repeats_per_protocol: 2
+  action_pattern: cycle-all-classes-by-sorted-point-id-v1
+  final_replay_must_match: true
+
+recipe_v2:
+  nm_per_coordinate: 1.0
+  control_conflict_policy: both-sides-conflict-stay-v1
+  solver:
+    simulator: simple
+    lithography_config: config/lithosimple.txt
+    image_size: [2048, 2048]
+    inner_step_sizes_nm: [8, 8, 8, 8, 4, 4, 4, 4]
+    mask_displacement_limit_nm: 24
+    threshold: 0.5
+  fragment_parameters_nm:
+    corner: 16
+    uniform: 32
+  # 六张 train 版图的全点几何扫描均支持该候选；分层 sensitivity 与冲突门禁尚未通过。
+  epe_normal_offsets_nm: [-20, -10, 0, 10, 20]
+  epe_probe_distance_nm: 24
+  probe_target_validity: inner_inside_and_outer_outside
+  reject_probe_conflicts: true
+  reject_quantized_action_aliases: true
+  plain_sb3_requires_all_actions_valid: true
+  geometry_adapter:
+    version: openilt-dissect-parent-edge-adapter-v2
+    raster_mapping_version: db-coordinate-equals-raster-pixel-v1
+    raster_scale: 1.0
+    raster_offset_xy: [0, 0]
+    normal_probe_semantics_version: target-two-sided-axis-probe-v1
+    normal_probe_coordinate: 2
+    minimum_fragment_rule_version: min-corner-uniform-coordinate-v1
+  observation:
+    channels: 5
+    patch_size: 128
+    legacy_64_status: excluded_insufficient_control_context
+    multiscale_status: not_frozen
+    actor_state: frozen_zero_offset_baseline
+    # 固定抽样与训练结果无关；PNG 用于汇报，NPZ 保留实际送入 Actor 的 image/vector。
+    report_examples:
+      enabled: true
+      example_count_per_layout: 4
+      selection_policy: geometry-diverse-by-point-id-v1
+  reward:
+    weights: {l2: 1.0, epe: 100.0, pvb: 1.0}
+    scale: 0.00001
+    gamma: 1.0
+    gae_lambda: 1.0
+    dense_protocol: ppo_dense_sequential
+    terminal_protocol: ppo_terminal_full_recipe
+
+golden:
+  # source/constraint 跨版图固定；其余三个哈希由每张 train 版图的两次独立 preflight 一致性冻结。
+  evaluator: openilt_evaluation_epecheck
+  constraint_coordinate: 15
+  source_sha256: cc2c111993491f9f0123e0bbad5e9815acb849e0f9d36b3ccefe0e12589f3d8c
+  sampling_state_sha256: null
+  coordinate_system_sha256: null
+  evaluator_contract_sha256: null
+  layout_contracts:
+    M1_test1:
+      sampling_state_sha256: 0599d73a03407624b7b9576ea0bfd7fb596da064d8315113374ce07966afcd2d
+      coordinate_system_sha256: 048d16920cadb5e9bdccf4dd73f58062d7034a8c25c34573485c24513c99f571
+      evaluator_contract_sha256: 381daf62fb1024370bae0f375a00a66acc3c0d997fac7e2342e141743b3ede1f
+    M1_test2:
+      sampling_state_sha256: 5b4b1903622addc33329e571e63a374bff8eb323d08f1115362d261cf1e40503
+      coordinate_system_sha256: 84d53e9385d8cbf35c154f113629122d4e43242be43ecdb28ee93ecb153d2588
+      evaluator_contract_sha256: 73ecc68c552981947f7a498969c2a2e0d20c2badccc23f96ab35c62c4eb9e2f1
+    M1_test3:
+      sampling_state_sha256: a0a071e3ab363ef961bfa2da3f4a65cf0f1a187f831671ddf1a0b7e20d62997b
+      coordinate_system_sha256: af9ddbb1d3a28346ad19b89ca34cb37bd4fc399c5b1a27f302f28c2f59f8f8ea
+      evaluator_contract_sha256: 65897c23e289083f2dfe0c179ae637ea7f7e6fbaa2a7697d9391e1c9b3563806
+    M1_test4:
+      sampling_state_sha256: d01c09fd9bfe08878fbbfe69d8b5560a13926ed8033b16c7548683546527d923
+      coordinate_system_sha256: bba31203c084fc256bed7764b2224a9b2578ddd6c563288a6707ff5806e60fbd
+      evaluator_contract_sha256: 44baf3575cb466d7e0f3443de78cb13c5bff6c3bff729dadd9d1dcd88b3da133
+    M1_test5:
+      sampling_state_sha256: 700ef521f52b743f18d4d6c0d2951f90c91f889ceb9102ee17b7e953c400beb1
+      coordinate_system_sha256: de9b32d50381e90db3d21ce38271fd3319fdc2354664a1878b7a1f2be98086a2
+      evaluator_contract_sha256: d07a33d30a7d652f7925811541f86afb92e4413ca2cda7fb61d60ee5f0672618
+    M1_test6:
+      sampling_state_sha256: a2fd1ea10dce23e66d9d93abff5388394dfbd2ea4853db956fd11ec0d6fa6122
+      coordinate_system_sha256: 1276220777f4f040cceeff6372f9bf6c7d08fbbb20ccdf835a68eb58fc88f75d
+      evaluator_contract_sha256: 7795ec8ed58897d92d42f3187cfe925fb9c23979751ab3784b2b6dd3578fc587
+  verification_status: train_layout_contracts_frozen_from_two_matching_preflights
+
+training:
+  enabled: false
+  # 单图、单 rollout 数值 smoke；这些是项目版本化选择，不是论文公开超参数。
+  smoke:
+    enabled: true
+    layout_parent: M1_test4
+    protocols: [ppo_dense_sequential, ppo_terminal_full_recipe]
+    seed: 0
+    total_timesteps: 104
+    n_steps: 104
+    batch_size: 52
+    n_epochs: 1
+    learning_rate: 0.0003
+    gamma: 1.0
+    gae_lambda: 1.0
+    clip_range: 0.2
+    ent_coef: 0.0
+    vf_coef: 0.5
+    max_return_p99_abs: 10.0
+    max_approx_kl: 0.1
+    max_clip_fraction: 0.8
+  # 直接复用 smoke 超参数，只增加到恰好三次完整更新，以检验连续三次数值警戒规则。
+  pilot:
+    enabled: true
+    layout_parent: M1_test4
+    protocols: [ppo_dense_sequential, ppo_terminal_full_recipe]
+    seed: 0
+    rollout_count: 3
+    consecutive_failure_updates: 3
+    max_value_target_normalized_rmse: 10.0
+    max_return_p99_abs: 10.0
+    max_approx_kl: 0.1
+    max_clip_fraction: 0.8
+  # 一个共享 Actor-Critic 同时从 M1_test5/6 采样；两图各有 246 点且不向 Actor 注入 layout ID。
+  # 每次 PPO 更新中，每个环境完整运行 2 个 episode；五次更新后每图恰好 10 个训练 episode。
+  small_train:
+    enabled: true
+    protocols: [ppo_terminal_full_recipe]
+    layout_parents: [M1_test5, M1_test6]
+    seed: 0
+    episodes_per_layout_per_update: 2
+    update_count: 5
+    episodes_per_layout: 10
+    n_steps_per_env: 492
+    total_timesteps: 4920
+    batch_size: 123
+    n_epochs: 1
+    learning_rate: 0.0003
+    gamma: 1.0
+    gae_lambda: 1.0
+    clip_range: 0.2
+    ent_coef: 0.0
+    vf_coef: 0.5
+    reward_scale: 0.00001
+    random_recipe_count_per_layout: 10
+    consecutive_failure_updates: 3
+    max_post_update_value_target_normalized_rmse: 10.0
+    max_return_p99_abs: 10.0
+    max_approx_kl: 0.1
+    max_clip_fraction: 0.8
+  blocked_by:
+    - shared_terminal_small_training_not_completed
+    - dense_critic_value_target_rmse_failed_three_consecutive_updates
+
+acceptance:
+  # 比例与单项 guardrail 仍在设计文档的“尚待证据”列表，不得提前硬编码。
+  aggregate_improvement_threshold: null
+  l2_guardrail: null
+  epe_guardrail: null
+  pvb_guardrail: null
+
+# 搜索护栏独立于正式 acceptance：三项指标不得超过固定全零基线。
+search:
+  enabled: true
+  # 默认不自动启动续跑；需要时填旧 runs 目录，旧工件只读，新结果另存。
+  resume_from: null
+  layout_parents: [M1_test1, M1_test2, M1_test3, M1_test4, M1_test5, M1_test6]
+  seeds: [0]
+  # 每方法每图每 seed 使用 实际 EPE 点数 × 四个替代动作 次候选求解。
+  budget_policy: one_full_coordinate_sweep
+  guardrail: all_metrics_le_zero_baseline

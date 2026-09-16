@@ -15,6 +15,7 @@ from .models import OpcMetrics
 
 DISPLACEMENT_CLASSES_NM: Tuple[int, ...] = (-40, -30, -20, -10, 0, 10, 20, 30, 40)
 SIMPLEOPC_LOSS_VERSION = "paper-weighted-sum-initial-normalized-v1"
+RECIPE_OPC_LOSS_VERSION = "paper-weighted-sum-raw-v1"
 
 
 def weighted_opc_loss(metrics: Mapping[str, float], weights: Mapping[str, float]) -> float:

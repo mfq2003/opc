@@ -28,9 +28,17 @@ def train_oracle_stage(
     root: Path,
     smoke: bool = False,
     candidate_index: Path | None = None,
+    preflight: bool = False,
 ) -> None:
     """在 CUDA 上训练 PPO；支持单 clip 冒烟或按索引逐 clip、逐种子运行。"""
     environment = str(config.get("oracle", {}).get("environment", "legacy-candidate-point-v1"))
+    if environment == "simpleopc-recipe-point-v1":
+        if candidate_index is not None:
+            raise ValueError("Recipe point PPO 直接读取 GLP，不接受旧 candidate-index")
+        _train_recipe_point_stage(config, root, smoke=smoke, preflight=preflight)
+        return
+    if preflight:
+        raise ValueError("--preflight 只支持 simpleopc-recipe-point-v1")
     if environment == "simpleopc-multistep-v3":
         if candidate_index is not None:
             raise ValueError("SimpleOPC 多步 PPO 直接读取 GLP，不接受旧 candidate-index")
@@ -115,6 +123,260 @@ def train_oracle_stage(
             "models": clip_results[0]["models"],
         })
     (root / "stage-result.json").write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def create_recipe_point_solver(config: Dict[str, Any], clip_id: str):
+    """按训练主线的同一配置为指定 ICCAD13 版图建立只读 Recipe solver。"""
+    from .recipe_ppo import OpenILTRecipeAwareSolver
+
+    data = config["data"]
+    backend_config = config["openilt"]
+    oracle = config["oracle"]
+    simpleopc = config.get("simpleopc")
+    if not isinstance(simpleopc, dict):
+        raise ValueError("simpleopc-recipe-point-v1 需要 simpleopc 配置段")
+    image_size = tuple(int(value) for value in simpleopc.get("image_size", [2048, 2048]))
+    if len(image_size) != 2:
+        raise ValueError("simpleopc.image_size 必须包含 width、height 两个整数")
+    return OpenILTRecipeAwareSolver(
+        openilt_dir=Path(data["openilt_dir"]),
+        expected_commit=backend_config["commit"],
+        layout_path=Path(data["iccad13_dir"]) / f"{clip_id}.glp",
+        reward_weights=dict(oracle["reward_weights"]),
+        lithography_config=Path(oracle["lithography_config"]),
+        simulator=oracle["simulator"],
+        image_size=(image_size[0], image_size[1]),
+        openilt_scale=int(oracle.get("openilt_scale", 1)),
+        nm_per_coordinate=float(simpleopc.get("nm_per_coordinate", 1.0)),
+        base_fragment_length_nm=float(simpleopc["base_fragment_length_nm"]),
+        min_fragment_length_nm=float(simpleopc["min_fragment_length_nm"]),
+        recipe_displacement_limit_nm=float(oracle["displacement_nm_limit"]),
+        epe_sample_distance_nm=float(simpleopc["epe_sample_distance_nm"]),
+        inner_step_sizes_nm=[float(value) for value in simpleopc["inner_step_sizes_nm"]],
+        mask_displacement_limit_nm=float(simpleopc["mask_displacement_limit_nm"]),
+        threshold=float(simpleopc.get("threshold", 0.5)),
+        cache_entries=int(simpleopc.get("solver_cache_entries", 8)),
+    )
+
+
+def _train_recipe_point_stage(
+    config: Dict[str, Any], root: Path, smoke: bool, preflight: bool = False
+) -> None:
+    """训练共享的单步九分类 Recipe PPO，并逐 clip 导出 EPE/FRAG 最佳 Recipe。"""
+    from .metrics import DISPLACEMENT_CLASSES_NM, RECIPE_OPC_LOSS_VERSION
+    from .recipe_ppo import (
+        RECIPE_ENV_VERSION,
+        RECIPE_OBSERVATION_VERSION,
+        RECIPE_POINT_VERSION,
+        RecipePointPPOEnv,
+    )
+    from .recipe_ppo_runner import (
+        PPO_RECIPE_LABEL_VERSION,
+        build_recipe_payload,
+        deterministic_recipe_rollout,
+        run_default_recipe,
+        train_shared_recipe_ppo,
+    )
+
+    data = config["data"]
+    backend_config = config["openilt"]
+    oracle = config["oracle"]
+    simpleopc = config.get("simpleopc")
+    if not isinstance(simpleopc, dict):
+        raise ValueError("simpleopc-recipe-point-v1 需要 simpleopc 配置段")
+    if str(oracle.get("reward_mode", "paper_raw")) != "paper_raw":
+        raise ValueError("论文主线当前要求 oracle.reward_mode=paper_raw")
+    displacement_limit = float(oracle["displacement_nm_limit"])
+    if displacement_limit != 40.0:
+        raise ValueError("论文公开的 Recipe 点位移范围要求 displacement_nm_limit=40")
+    configured_classes = tuple(int(value) for value in simpleopc["displacement_classes_nm"])
+    if configured_classes != DISPLACEMENT_CLASSES_NM:
+        raise ValueError(
+            "simpleopc.displacement_classes_nm 必须为 "
+            f"{list(DISPLACEMENT_CLASSES_NM)}"
+        )
+    patch_size = int(simpleopc.get("local_patch_size", 64))
+    if patch_size != 64:
+        raise ValueError("论文主线当前固定使用 64×64 像素局部图像")
+    if "step_sizes_nm" in simpleopc:
+        raise ValueError("Recipe point PPO 禁止配置旧四步 step_sizes_nm")
+    image_size = tuple(int(value) for value in simpleopc.get("image_size", [2048, 2048]))
+    if len(image_size) != 2:
+        raise ValueError("simpleopc.image_size 必须包含 width、height 两个整数")
+    split_parents = {
+        "train": list(data["train_parents"]),
+        "validation": list(data["validation_parents"]),
+        "test": list(data["test_parents"]),
+    }
+    jobs = [
+        (str(parent), split)
+        for split in ("train", "validation", "test")
+        for parent in split_parents[split]
+    ]
+    if smoke or preflight:
+        jobs = jobs[:1]
+    seeds = [int(oracle["seeds"][0])] if smoke else [int(value) for value in oracle["seeds"]]
+    timesteps = int(oracle["smoke_timesteps"] if smoke else oracle["total_timesteps"])
+
+    def make_solver(clip_id: str):
+        """为一个 GLP 建立只读 OpenILT recipe-aware solver。"""
+        return create_recipe_point_solver(config, clip_id)
+
+    def make_env(solver, shuffle_points: bool) -> RecipePointPPOEnv:
+        """为共享 solver 建立独立的点级 episode 状态。"""
+        return RecipePointPPOEnv(
+            solver=solver,
+            reward_weights=dict(oracle["reward_weights"]),
+            displacement_classes_nm=configured_classes,
+            patch_size=patch_size,
+            shuffle_points=shuffle_points,
+            metric_epsilon=float(simpleopc.get("metric_epsilon", 1.0)),
+        )
+
+    train_clip_ids = [clip_id for clip_id, split in jobs if split == "train"]
+    if not train_clip_ids:
+        raise ValueError("Recipe PPO 运行没有 train clip")
+    train_solvers = {clip_id: make_solver(clip_id) for clip_id in train_clip_ids}
+    clip_results: Dict[str, Dict[str, Any]] = {}
+
+    def ensure_clip_entry(clip_id: str, split: str, solver) -> Dict[str, Any]:
+        """在训练前保存零位移默认 recipe 基线，并初始化 stage 条目。"""
+        existing = clip_results.get(clip_id)
+        if existing is not None:
+            return existing
+        clip_root = root / "clips" / clip_id
+        clip_root.mkdir(parents=True, exist_ok=True)
+        baseline = run_default_recipe(make_env(solver, shuffle_points=False), seed=0)
+        baseline_path = clip_root / "default-recipe.json"
+        baseline_path.write_text(
+            json.dumps(baseline, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        points = tuple(solver.recipe_points)
+        entry = {
+            "clip_id": clip_id,
+            "split": split,
+            "layout_path": str(Path(data["iccad13_dir"]) / f"{clip_id}.glp"),
+            "layout_sha256": solver.layout_sha256,
+            "point_count": len(points),
+            "epe_point_count": sum(point.task_type == "EPE" for point in points),
+            "frag_point_count": sum(point.task_type == "FRAG" for point in points),
+            "episode_horizon": len(points),
+            "default_recipe_path": str(baseline_path),
+            "models": [],
+            "ppo_recipes": [],
+        }
+        clip_results[clip_id] = entry
+        return entry
+
+    for clip_id in train_clip_ids:
+        ensure_clip_entry(clip_id, "train", train_solvers[clip_id])
+
+    shared_models = []
+
+    def stage_payload() -> Dict[str, Any]:
+        """构造当前可恢复进度和最终结果共用的数据协议。"""
+        return {
+            "mode": "preflight" if preflight else ("smoke" if smoke else "full"),
+            "environment": RECIPE_ENV_VERSION,
+            "observation_version": RECIPE_OBSERVATION_VERSION,
+            "point_version": RECIPE_POINT_VERSION,
+            "loss_version": RECIPE_OPC_LOSS_VERSION,
+            "label_version": PPO_RECIPE_LABEL_VERSION,
+            "reward_mode": "paper_raw",
+            "openilt_mutation": "none",
+            "policy_scope": "shared_train_clips",
+            "action_space": "Discrete(9)",
+            "action_semantics": "one_absolute_nine_class_decision_per_recipe_point",
+            "patch_shape": [5, 64, 64],
+            "vector_shape": [14],
+            "seeds": seeds,
+            "timesteps_per_shared_seed": timesteps,
+            "shared_models": list(shared_models),
+            "displacement_classes_nm": list(DISPLACEMENT_CLASSES_NM),
+            "paper_displacement_range_nm": [-displacement_limit, displacement_limit],
+            "clips": [
+                clip_results[clip_id]
+                for clip_id, _split in jobs
+                if clip_id in clip_results
+            ],
+            "decision_tree_labels": "deferred_until_ppo_acceptance",
+            "frag_status": "implemented_as_recipe_segmentation_points",
+        }
+
+    def write_progress(status: str, seed: int | None = None, clip_id: str | None = None) -> None:
+        """在长任务关键节点原子替换小型进度文件，保留中断后的只读证据。"""
+        payload = stage_payload()
+        payload.update({"progress_status": status, "current_seed": seed, "current_clip": clip_id})
+        progress_path = root / "stage-progress.json"
+        temporary = progress_path.with_suffix(".json.tmp")
+        temporary.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        temporary.replace(progress_path)
+
+    write_progress("initialized")
+    if preflight:
+        clip_id = train_clip_ids[0]
+        environment = make_env(train_solvers[clip_id], shuffle_points=False)
+        observation, reset_info = environment.reset(seed=seeds[0])
+        result = stage_payload()
+        result["preflight"] = {
+            "clip_id": clip_id,
+            "image_shape": list(observation["image"].shape),
+            "vector_shape": list(observation["vector"].shape),
+            "reset": reset_info,
+            "training_started": False,
+        }
+        (root / "stage-result.json").write_text(
+            json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        write_progress("complete")
+        return
+    for seed in seeds:
+        train_envs = [
+            make_env(train_solvers[clip_id], shuffle_points=bool(simpleopc.get("shuffle_points", True)))
+            for clip_id in train_clip_ids
+        ]
+        model, model_path = train_shared_recipe_ppo(
+            train_envs=train_envs,
+            output_path=root / "models" / f"shared-recipe-seed-{seed}",
+            total_timesteps=timesteps,
+            seed=seed,
+            learning_rate=float(oracle["learning_rate"]),
+            n_steps=int(oracle.get("ppo_n_steps", 256)),
+            batch_size=int(oracle.get("ppo_batch_size", 64)),
+        )
+        shared_models.append(str(model_path))
+        write_progress("model_saved", seed=seed)
+        for clip_id, split in jobs:
+            temporary_solver = clip_id not in train_solvers
+            solver = train_solvers.get(clip_id) or make_solver(clip_id)
+            entry = ensure_clip_entry(clip_id, split, solver)
+            evaluation_env = make_env(solver, shuffle_points=False)
+            rollout = deterministic_recipe_rollout(model, evaluation_env, seed)
+            recipe_payload = build_recipe_payload(evaluation_env, rollout, model_path, seed)
+            recipe_path = root / "recipes" / f"{clip_id}-seed-{seed}.recipe.json"
+            recipe_path.parent.mkdir(parents=True, exist_ok=True)
+            recipe_path.write_text(
+                json.dumps(recipe_payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            entry["models"].append(str(model_path))
+            entry["ppo_recipes"].append(str(recipe_path))
+            write_progress("recipe_saved", seed=seed, clip_id=clip_id)
+            if temporary_solver:
+                del evaluation_env
+                del solver
+
+    result = stage_payload()
+    (root / "stage-result.json").write_text(
+        json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    write_progress("complete")
 
 
 def _train_simpleopc_stage(config: Dict[str, Any], root: Path, smoke: bool) -> None:
