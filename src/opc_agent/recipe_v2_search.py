@@ -1,13 +1,16 @@
 """本模块实现固定 FRAG 的 EPE 黑盒搜索诊断。
 
-输入为冻结的 v2 配置和训练版图；当前入口只执行全零基线与离散坐标搜索，
+输入为冻结的 v2 配置和显式版图范围；默认只允许训练版图，只有单独授权的
+``validation_test_diagnostic`` 范围才允许搜索 M1_test7–10。入口执行全零基线与离散坐标搜索，
 随机函数分支仅保留历史回归兼容，不再安排随机实验。各方法共用
 完整 terminal solver 与 Golden 评价。输出逐候选日志、完整动作、指标、独立回放、
-输入样例和结果图片。搜索不训练 PPO，全部结果仅为 diagnostic_only。
+全零/最终图像、输入样例和结果图片。搜索不训练 PPO；验证/测试版图搜索使用自身 solver
+反馈，因而只能作为逐图启发式诊断，不能冒充未见版图泛化或正式验收。
 """
 from __future__ import annotations
 
 import json
+import hashlib
 import time
 from pathlib import Path
 
@@ -37,7 +40,60 @@ def evaluate_recipe(episode, actions):
     }
 
 
-def search_recipe(episode, method, seed, budget, root, resume_from=None, baseline_calls=1):
+def _write_binary_png(path, array):
+    """把冻结 solver 二值数组写为 PNG，并返回文件 SHA-256。"""
+    pixels = np.clip(np.asarray(array) * 255, 0, 255).astype(np.uint8)
+    ok, encoded = cv2.imencode(".png", pixels)
+    if not ok:
+        raise RuntimeError(f"搜索结果图片编码失败：{path}")
+    payload = encoded.tobytes()
+    Path(path).write_bytes(payload)
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _golden_identity(episode):
+    """记录本次真实 evaluator 的逐版图身份；未预冻结字段也不能丢失。"""
+    evaluator = episode.golden_evaluator
+    return {
+        "evaluator_version": str(evaluator.evaluator_version),
+        "source_sha256": str(evaluator.evaluator_source_sha256),
+        "target_sha256": str(evaluator.frozen_target_sha256),
+        "sampling_state_sha256": str(evaluator.sampling_state_sha256),
+        "coordinate_system_sha256": str(evaluator.coordinate_system_sha256),
+        "evaluator_contract_sha256": str(evaluator.evaluator_contract_sha256),
+        "epe_constraint_coordinate": int(evaluator.epe_constraint_coordinate),
+        "nm_per_coordinate": float(evaluator.nm_per_coordinate),
+    }
+
+
+def _validate_search_scope(config):
+    """冻结训练与验证/测试两种互斥范围，拒绝静默混合或只挑部分评估图。"""
+    settings = config["search"]
+    layouts = list(settings["layout_parents"])
+    train = list(config["data"]["train_parents"])
+    evaluation = list(config["data"]["validation_parents"] + config["data"]["test_parents"])
+    scope = settings.get("scope", "train_only")
+    if scope == "train_only":
+        if layouts != train:
+            raise ValueError("train_only 搜索必须恰好覆盖全部训练版图")
+        return scope, True
+    if scope == "validation_test_diagnostic":
+        if layouts != evaluation:
+            raise ValueError("validation_test_diagnostic 必须恰好覆盖 M1_test7–10")
+        return scope, False
+    raise ValueError("search.scope 只能是 train_only 或 validation_test_diagnostic")
+
+
+def search_recipe(
+    episode,
+    method,
+    seed,
+    budget,
+    root,
+    resume_from=None,
+    baseline_calls=1,
+    save_baseline_artifacts=False,
+):
     """运行一次等预算搜索；坐标候选从同一 incumbent 出发，平局保持旧值。"""
     if method not in ("random", "coordinate") or budget <= 0:
         raise ValueError("非法搜索方法或预算")
@@ -51,6 +107,17 @@ def search_recipe(episode, method, seed, budget, root, resume_from=None, baselin
     baseline = {"metrics": reset["initial_raw_metrics"],
                 "j": float(reset["initial_raw_weighted_loss"])}
     actions = {p: zero for p in points}
+    baseline_artifacts = None
+    if save_baseline_artifacts:
+        baseline_result = episode.baseline_result
+        baseline_artifacts = {
+            "mask_path": "baseline-mask.png",
+            "mask_sha256": _write_binary_png(root / "baseline-mask.png", baseline_result.mask_image),
+            "printed_path": "baseline-printed.png",
+            "printed_sha256": _write_binary_png(
+                root / "baseline-printed.png", baseline_result.printed_nominal
+            ),
+        }
     # 基线已由 reset 求解；直接保存它的指标，避免额外零 Recipe 求解。
     best = {**baseline, "actions": dict(actions)}
     calls = 0
@@ -144,13 +211,14 @@ def search_recipe(episode, method, seed, budget, root, resume_from=None, baselin
     cv2.putText(canvas, f"{method} seed={seed}: best feasible J vs candidate calls", (30, 30), cv2.FONT_HERSHEY_SIMPLEX, .6, (0, 0, 0), 1)
     cv2.putText(canvas, f"J range [{low:.1f}, {high:.1f}]   calls [0, {budget}]", (60, 455), cv2.FONT_HERSHEY_SIMPLEX, .6, (0, 0, 0), 1)
     (root / "search-curve.png").write_bytes(cv2.imencode(".png", canvas)[1].tobytes())
+    final_artifacts = {}
     for name, array in (("target", episode.solver.target_image),
                         ("final-mask", replay.mask_image), ("final-printed", replay.printed_nominal)):
-        pixels = np.clip(np.asarray(array) * 255, 0, 255).astype(np.uint8)
-        ok, encoded = cv2.imencode(".png", pixels)
-        if not ok:
-            raise RuntimeError("搜索结果图片编码失败")
-        (root / (name + ".png")).write_bytes(encoded.tobytes())
+        file_name = name + ".png"
+        final_artifacts[name.replace("-", "_")] = {
+            "path": file_name,
+            "sha256": _write_binary_png(root / file_name, array),
+        }
     result = {"method": method, "seed": seed, "baseline": baseline,
               "best": {**best, "offsets_nm": offsets, "recipe_sha256": recipe_hash},
               "candidate_budget": budget, "candidate_calls": calls,
@@ -163,6 +231,8 @@ def search_recipe(episode, method, seed, budget, root, resume_from=None, baselin
               "reused_candidate_calls": reused,
               "solver_call_counts": {"baseline": baseline_calls, "candidate": calls - reused,
                                      "final_replay": 1, "total": calls - reused + baseline_calls + 1},
+              "baseline_artifacts": baseline_artifacts,
+              "final_artifacts": final_artifacts,
               "elapsed_seconds": time.monotonic() - started}
     (root / "result.json").write_text(json.dumps(result, ensure_ascii=False, indent=2, allow_nan=False), encoding="utf-8")
     return result
@@ -176,15 +246,14 @@ def search_budget(episode):
 
 
 def run_v2_search(config, artifact_root):
-    """六图固定 seed=0 仅执行坐标搜索；每图一次基线，旧候选只读迁移。"""
+    """在显式冻结范围内以 seed=0 执行坐标搜索；每图一次基线和独立回放。"""
     settings = config["search"]
     layouts = settings["layout_parents"]
     if settings["enabled"] is not True or config["training"]["enabled"] is not False:
         raise ValueError("搜索必须启用且通用训练禁用")
-    if layouts != [f"M1_test{i}" for i in range(1, 7)] or settings["seeds"] != [0]:
-        raise ValueError("搜索固定六张训练版图 M1_test1–6 和单种子 seed=0")
-    if not set(layouts).issubset(config["data"]["train_parents"]):
-        raise ValueError("搜索只允许训练版图")
+    scope, require_layout_contract = _validate_search_scope(config)
+    if settings["seeds"] != [0]:
+        raise ValueError("搜索固定使用单种子 seed=0")
     recipe = config["recipe_v2"]
     if recipe["fragment_parameters_nm"] != {"corner": 16, "uniform": 32} or recipe["epe_normal_offsets_nm"] != [-20, -10, 0, 10, 20]:
         raise ValueError("搜索必须保持冻结 FRAG 和五动作")
@@ -198,7 +267,12 @@ def run_v2_search(config, artifact_root):
         if {k: v for k, v in old_config.items() if k != "search"} != {k: v for k, v in config.items() if k != "search"}:
             raise ValueError("续跑配置与旧快照不一致（search 设置之外必须完全相同）")
     for layout in layouts:
-        episode, fields = _build_episode(config, layout, shuffle_points=False)
+        episode, fields = _build_episode(
+            config,
+            layout,
+            shuffle_points=False,
+            require_layout_contract=require_layout_contract,
+        )
         _, baseline_info = episode.reset()
         if source is not None:
             reference = source / layout / "seed-0" / "coordinate" / "result.json"
@@ -214,14 +288,23 @@ def run_v2_search(config, artifact_root):
                 old_arm = source / layout / f"seed-{seed}" / method if source else None
                 result = search_recipe(episode, method, seed, budget,
                                        root / layout / f"seed-{seed}" / method,
-                                       resume_from=old_arm, baseline_calls=int(seed == 0))
+                                       resume_from=old_arm, baseline_calls=int(seed == 0),
+                                       save_baseline_artifacts=True)
                 result["point_count"] = episode.episode_horizon
-                arms.append({"layout_parent": layout, "golden_verified_fields": fields, **result})
+                arms.append({
+                    "layout_parent": layout,
+                    "golden_verified_fields": fields,
+                    "golden_identity": _golden_identity(episode),
+                    **result,
+                })
                 print(f"{layout} seed={seed} {method}: J={result['best']['j']} calls={result['candidate_calls']}", flush=True)
                 if not result["final_replay_equal"]:
                     raise RuntimeError("搜索最终独立回放不一致；已保留该臂工件")
     revision = _validate_openilt(Path(config["data"]["openilt_dir"]), config["openilt"]["commit"])
-    result = {"status": "diagnostic_only", "search_version": "coordinate-only-resumable-v3",
+    result = {"status": "diagnostic_only", "search_version": "coordinate-only-resumable-v4-evaluation-scope",
+              "search_scope": scope,
+              "uses_layout_specific_solver_feedback": True,
+              "generalization_claim_allowed": False,
               "resume_from": str(source) if source else None,
               "budget_policy": settings["budget_policy"],
               "arms": arms, "accepted": False, "training_enabled": False,

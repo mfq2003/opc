@@ -1,8 +1,428 @@
 # OPC Agent：点级 Recipe PPO 主线
 
-本项目复现论文 *Intelligent OPC Engineer Assistant* 的两阶段思路。当前工作已从 PPO 链路验证转向 v2 坐标搜索及其 Recipe 的探索性决策树蒸馏准备：调整原始 target 上的 EPE 测量点，项目侧 recipe-aware OPC solver 在内部优化 mask，FRAG 暂时固定。PPO 续训暂停，MLLM/Qwen 暂缓；搜索或决策树结果不能替代 PPO 验收。最新工作交接以文首 2026-09-16 记录为准。
+## 2026-09-23：M1_test7–10 启发式诊断与十图 PVB/EPE N/EPE D 汇总
 
-## 2026-09-16 工作交接：六图搜索完成，Recipe 已导出，决策树尚未训练
+`v2-search` 默认行为仍严格锁定 `M1_test1–6`。只有同时提供完整评估版图列表和显式授权参数，
+才允许在 `M1_test7–10` 上运行同一套 `coordinate-only-resumable-v4-evaluation-scope` 坐标搜索：
+
+```bash
+export PYTHONPATH=src
+export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
+export PYTHONDONTWRITEBYTECODE=1
+python -B -m opc_agent.cli v2-search \
+  --config configs/recipe_ppo_v2.yaml \
+  --layouts M1_test7 M1_test8 M1_test9 M1_test10 \
+  --allow-validation-test-diagnostic
+```
+
+协议继续固定 FRAG `(corner=16nm, uniform=32nm)`、EPE 五动作
+`[-20,-10,0,+10,+20]nm`、`seed=0` 和一次完整坐标扫描。候选只有在 L2、OpenILT 15 坐标
+Golden EPE、PVB 均不高于全零基线且 `J=L2+100×EPE+PVB` 严格下降时才接受；每图最后必须
+独立完整回放一致。新工件额外保存 `baseline-mask.png`、`baseline-printed.png` 及哈希，并记录
+真实 Golden evaluator 的逐图身份。评估图搜索使用了每张图自己的 solver 反馈，所以结果始终是
+`diagnostic_only`，不得解释为共享模型对未见版图的泛化表现或正式 acceptance。
+新搜索还会在 `result.json` 中保存 target/final mask/final printed PNG 的 SHA-256；
+十图汇总在存在该新字段时必须校验一致，旧六图无该字段时保留兼容但不声称已做哈希校验。
+
+新四图完成并下载后，用已有六图运行和新四图运行生成统一十图报告：
+
+```bash
+PYTHONPATH=src python -B -m opc_agent.recipe_v2_ten_layout_summary \
+  --search-runs \
+    runs/20260915T014128Z-v2-search-5697a08c \
+    runs/<M1_test7-10的新v2-search运行目录> \
+  --output-dir runs/<新的十图汇总目录> \
+  --seed 0 \
+  --tolerance-nm 1
+```
+
+汇总入口要求两个运行的核心 OpenILT、solver、FRAG、动作、几何和 Golden 全局协议一致，且
+M1_test1–10 恰好各出现一次。旧六图没有基线 printed 图，因此会各独立回放一次全零 Recipe，
+先核对历史 L2/15坐标EPE/PVB/J 完全一致，再把新基线图写入汇总目录；不会修改旧运行。
+若新四图的 `result.json` 已声明基线或最终 PNG，任一图缺失或哈希不一致都会立即停止，
+不会用重放掩盖下载不完整。
+EPE N/D 使用 v2 `dissect(16,32)` 的固定 segment 中点：EPE N 是距离严格大于 1nm 的点数，
+EPE D 只累加这些点到最终印刷前景边界的完整最近欧氏距离。1nm EPE N/D 只是后处理指标，
+不属于原搜索护栏，结果可能改善也可能变差。
+
+输出 `ten-layout-epe-summary.json` 和 `ten-layout-epe-summary.csv`，包含逐图基线→最终 PVB、
+EPE N、EPE D、绝对/相对变化、十图等权宏平均 `ALL_MEAN`，以及全部采样点上的
+违规总数、距离总和和违规率 `ALL_TOTAL`。
+不能只报告平均计数而省略每图采样点数和微观分母。当前本地缺少锁定 OpenILT/CUDA，
+这里只完成代码与 CPU 测试，真实 test7–10 搜索和十图数值必须在云端执行后登记。
+
+## 2026-09-23：按 Recipe v2 冻结点集离线补算 1 nm EPE N/D
+
+新增 `src/opc_agent/sampled_epe_metrics.py`，用于在不重跑 GPU 或 Solver 的前提下，从坐标搜索
+工件的 `target.png`、`final-mask.png`、`final-printed.png` 和 `result.json` 补算 1 nm EPE N/EPE D。
+采样点严格沿用本次搜索的 Recipe v2 冻结协议：从 `config.snapshot.yaml` 读取全局 FRAG
+`corner=16 nm`、`uniform=32 nm` 和几何适配器，调用锁定 OpenILT 的 `polygon.dissect` 重建
+segment，并取每个 segment 中点作为固定 EPE 采样点。v2 没有独立的“FRAG 采样点”；FRAG
+在这里是生成 EPE 点的全局分段参数，不能回退到 `simpleopc-recipe-point-v1` 的 96/8/±40 nm
+打点规则。重建点 ID 必须与 `result.json` 的完整动作点和搜索顺序集合逐一相等，并要求
+`final_replay_equal=true`，否则立即失败。该新指标不能与 OpenILT `EPE_CONSTRAINT=15` 的
+Golden violation count 混用。
+
+EPE N 统计距离严格大于 `1 nm` 的采样点数；EPE D 只累加这些违规点到最终印刷前景边界的
+完整最近欧氏距离，不累加未违规点，也不把 `distance-1 nm` 当作 EPE D。云端运行命令：
+
+```powershell
+$env:PYTHONPATH='src'
+python -B -m opc_agent.sampled_epe_metrics `
+  --run-dir runs/20260915T014128Z-v2-search-5697a08c `
+  --output-dir runs/20260915T014128Z-v2-search-5697a08c/sampled-epe-1nm `
+  --seed 0 `
+  --tolerance-nm 1
+```
+
+Linux 云端使用等价命令：
+
+```bash
+PYTHONPATH=src python -B -m opc_agent.sampled_epe_metrics \
+  --run-dir runs/20260915T014128Z-v2-search-5697a08c \
+  --output-dir runs/20260915T014128Z-v2-search-5697a08c/sampled-epe-1nm \
+  --seed 0 \
+  --tolerance-nm 1
+```
+
+成功后生成 `sampled-epe-metrics.json`（逐图输入/GLP/Recipe 哈希、旧 15 nm Golden EPE、新
+EPE N/D、全运行汇总和逐点距离）、`sampled-epe-summary.csv`（逐图及 ALL 汇总表）及
+`sampled-epe-points.csv`（逐点审计表）。程序还会读取 `search.layout_parents` 并与实际版图目录
+逐一核对；部分下载、额外版图、任一最终工件缺失、图像尺寸不一致、GLP 重建 target 不一致、
+点 ID 漂移或最终回放不一致都会立即失败。若云端 OpenILT/ICCAD13 不在配置快照记录的相对路径，
+可显式追加 `--openilt-dir` 和 `--iccad13-dir`，这两个参数只改数据路径，不改冻结统计协议。
+原始运行目录只读，结果写入单独输出目录。
+
+## 2026-09-23：候选价值模型族LOLO补跑完成
+
+新增 `src/opc_agent/recipe_v2_candidate_value_models.py`，在不改变六图LOLO、最佳冻结特征集、
+缺视觉特征点Full回退和Top-k计费口径的前提下，对比原始/组收益加权ExtraTrees、RandomForest、
+三种HistGradientBoosting、两阶段beneficial×gain和组内Pairwise Ranking。实验不调用Solver，
+不使用M1_test7–10。
+
+原始ExtraTrees的Top-2结果精确复现为86.65%改善捕获、48.70%调用减少；加权ExtraTrees、
+RandomForest和三种boosting均未提高。两阶段模型小幅提高到87.10%。Pairwise Top-2达到
+`103068/108482=95.0093%`改善捕获，同时减少48.70%调用，越过预设95%/40%筛选线；但只高出
+阈值10.1个J改善量，M1_test4仍只有84.46%，而且模型族是在同一组LOLO上事后比较。因此该
+结果仍为`diagnostic_only`，不解锁真实Proposal–Veto或Golden。
+
+主工件为`runs/v2-candidate-value-model-benchmark-001/`，独立复跑为
+`runs/v2-candidate-value-model-benchmark-002-repro/`；两次metrics和折外预测SHA256分别完全
+一致。下一步仍为零Solver的严格嵌套LOLO，把Pairwise视为候选base ranker而不是冻结模型。
+详细结果和复现命令见
+[候选价值模型族LOLO结果](docs/v2_candidate_value_model_benchmark_20260923_results.md)。
+
+## 2026-09-22 最新：候选价值LOLO完成，真实Solver pilot暂缓
+
+新增 `src/opc_agent/recipe_v2_candidate_value.py`，把六图坐标搜索的1306个点展开为5224条
+候选价值记录，并按版图留一训练固定参数 ExtraTrees 回归器。输入不使用版图名、point_id、
+最终动作标签、搜索顺序或候选运行后指标；34个缺完整视觉特征点退回四动作完整搜索，不靠
+缺数据虚增节省率。确定性连续几何由既有 `manifest.json` 重建，覆盖全部1306点，不调用
+OpenILT。
+
+最佳固定Top-2采用“28布尔+连续几何+动作+当前归一化状态”，在减少48.70%候选调用时，
+捕获既有轨迹86.65%的改善；训练折固定动作顺序为78.23%，随机Top-2精确期望为64.53%。
+Top-1减少73.05%调用，但只捕获76.38%。M1_test4的Top-2捕获仅50%，低于随机期望56%，
+因此未达到预设的“改善捕获≥95%、调用减少≥40%”门槛，不启动真实Proposal–Veto或Golden。
+
+事后Oracle上界显示：若能正确识别16个高regret组并从Top-2回退Full，可达到95.13%捕获且
+仍减少48.09%调用；该上界使用留出真值，不是模型成绩。下一步是严格嵌套LOLO的风险回退
+模型，禁止用外层留出结果调阈值。主工件为 `runs/v2-candidate-value-dataset-002/` 和
+`runs/v2-candidate-value-lolo-003/`，确定性复跑文件哈希完全一致。详细结果见
+[候选动作价值排序离线结果](docs/v2_candidate_value_20260922_results.md)。
+
+## 2026-09-22 最新：候选动作可辨识性审计完成
+
+新增只读入口 `src/opc_agent/recipe_v2_action_audit.py`，从既有六图坐标搜索工件重建每个点的
+四候选动作组，不调用 OpenILT、不训练模型。运行命令：
+
+```powershell
+$env:PYTHONPATH='src'
+python -B -m opc_agent.recipe_v2_action_audit `
+  --source-run runs/20260915T014128Z-v2-search-5697a08c `
+  --output runs/v2-action-identifiability-001
+```
+
+审计覆盖 1306 个点、5224 条候选记录：792 组（60.64%）的 mask、L2/EPE/PVB 和 J 均存在
+候选差异，514 组（39.36%）完全不变；284 组（21.75%）在当时 incumbent 状态下产生实际
+改善。五张改善版图的累计 J 改善 108482 全部来自可排序组，因此当前证据不支持停止整条
+EPE 点移动路线，可以进入离线候选价值回归/排序基线。M1_test3 的 260 组全部不变且无改善，
+保留为 skip/OOD 压力测试，不能据此推断联合动作无效。
+
+工件位于 `runs/v2-action-identifiability-001/`：`action-identifiability.json` 为总表，
+`layout-summary.csv` 为逐图摘要，`groups.csv` 为逐点动作组。状态固定为 `diagnostic_only`、
+`accepted=false`、`solver_calls=0`。完整下一阶段、门槛和 Solver 预算见
+[候选动作价值排序实施计划](docs/v2_candidate_value_ranking_plan.md)。当前先构建动作价值数据集并做
+六图留一离线基线；离线模型通过等预算随机/固定顺序对照前，不恢复 PPO、不消耗
+M1_test7–10。
+
+## 2026-09-21 最新：标准 0.5 阈值的二分类→四分类两阶段结果
+
+前一轮把 80% move precision 作为硬门槛，导致全部点回退 stay，不能表示用户要求的
+“先二分类，再四分类”实际串联表现。现已用固定概率阈值 `0.5` 重跑六图外层留一：
+二分类先判断 stay/move，判为 move 的点再交给四分类森林预测 `-20/-10/+10/+20 nm`。
+缺特征的 34 点仍保守回退 stay。
+
+```powershell
+$env:PYTHONPATH='src;runs/_tree_runtime_py312;runs/_tree_support_py312'
+& 'C:/Users/雷神/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/python.exe' -B -m opc_agent.recipe_v2_vision_gate build `
+  --input runs/v2-vision-dataset-004/training.xlsx `
+  --source-recipes docs/v2_search_20260915_recipes.json `
+  --output runs/v2-vision-gate-004-oof-fixed05-001 `
+  --gate-threshold 0.5
+```
+
+二分类门控在完整 1306 点上的结果（含 34 点缺特征回退）：
+
+| TP | FP | FN | TN | Precision | Recall | F1 |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 14 | 73 | 270 | 949 | 16.09% | 4.93% | 7.55% |
+
+四分类档位模型已独立训练，并只在 279 个有特征的真实移动点上做留一版图评估：
+
+| Accuracy | Macro-F1（四类） | Balanced accuracy |
+| ---: | ---: | ---: |
+| 38.71% | 32.27% | 33.08% |
+
+两阶段串联后，完整 Recipe 共预测 87 个 move，其中只有 14 个真 move，73 个为误移动；
+动作分布为 `-20/-10/0/+10/+20 nm = 24/18/1219/20/25`。五分类端到端指标为：
+
+| Accuracy | Macro-F1（五类） | Balanced accuracy |
+| ---: | ---: | ---: |
+| 73.20% | 20.35% | 21.56% |
+
+完整工件位于 `runs/v2-vision-gate-004-oof-fixed05-001/`。这组数值证明四分类模型确实已训练，
+但当前主要瓶颈是前级二分类：它只找回 14/284 个真移动点，而且额外误移动 73 点。
+因此该 Recipe 仍为 `diagnostic_only`，不能根据分类准确率宣称优化。
+
+这一组 87 个非零动作的 Recipe 现在值得做 Golden 回放；但本地仍缺少配置指定的
+`third_party/OpenILT` 锁定提交 checkout，因此尚未产生新的 L2/EPE/PVB/J。应在准备好的云端
+环境中执行本节下方的 `replay` 命令，共计 18 次 solver，再决定是否进入特征改造。
+
+## 2026-09-21 敏感性对照：80% precision 硬门槛的全 stay 回退
+
+新增 `src/opc_agent/recipe_v2_vision_gate.py`，将全点预测拆成两阶段：先用二分随机森林
+判断 stay/move，只有通过门控的点才进入既有四分类移动档位森林。外层按版图
+留一产生折外完整 Recipe；每个外层折的门控阈值只从其余训练版图的内层留一
+概率中选择，不读取留出版图标签调阈值。缺失特征和低置信度点均回退 stay。
+
+```powershell
+$env:PYTHONPATH='src;runs/_tree_runtime_py312;runs/_tree_support_py312'
+& 'C:/Users/雷神/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/python.exe' -B -m opc_agent.recipe_v2_vision_gate build `
+  --input runs/v2-vision-dataset-004/training.xlsx `
+  --source-recipes docs/v2_search_20260915_recipes.json `
+  --output runs/v2-vision-gate-004-oof-001 `
+  --minimum-move-precision 0.8
+```
+
+实际结果是有信息的负结果：六个外层折的内层概率都找不到达到 80% move precision
+的非空阈值，因此安全回退为全 stay。完整 1306 点中 1272 点有特征，34 点缺特征回退
+stay；预测 move 数为 0，因此 284 个真实移动点全部漏检。全量内层折外阈值曲线的最高
+move precision 仅约 27.42%（precision=156/569，recall=55.91%），说明失败不是单纯由 80%
+阈值过严导致；当前 28 个布尔特征不足以形成高精度的跨图移动选择器。
+
+完整工件位于 `runs/v2-vision-gate-004-oof-001/`：`metrics.json` 保留每折内层阈值和外层指标，
+`threshold-curve.csv` 保留精度-召回权衡，`out_of_fold_predictions.csv` 保留逐点概率，
+`predicted-recipes.json` 恰好覆盖 1306 点，`two_stage_models.joblib` 保留全数据模型及折外选定阈值。
+该运行始终为 `diagnostic_only`、`accepted=false`。
+
+暂不运行 Golden 回放：当前预测 Recipe 等于全零基线，重放不会提供新的模型质量证据；
+且本地缺少配置指定的 `third_party/OpenILT` 锁定提交 checkout。不将现有
+`third_party/OpenILT-main/OpenILT-main` 强行改名或修改配置后冒充正式回放。云端环境准备好后可执行：
+
+```bash
+python -B -m opc_agent.recipe_v2_vision_gate replay \
+  --config configs/recipe_ppo_v2.yaml \
+  --predicted-recipes runs/v2-vision-gate-004-oof-fixed05-001/predicted-recipes.json \
+  --output runs/<new-run-id>-v2-vision-gate-fixed05-golden-replay
+```
+
+`replay` 严格检查六张训练版图、全量 point_id、五动作表和训练禁用状态；每图计费
+1 次全零基线和 2 次独立预测 Recipe 回放，六图共 18 次 solver。只有两次回放完全一致，
+且每图 L2/EPE/PVB 不差于全零基线、平均 J 严格下降，才值得进入独立 validation；回放结果
+仍不会自动写成 accepted。
+
+当前停止继续搜索随机森林参数，下一步应先增加新版图预测时也能确定获取的连续几何特征，
+例如段长、到凹/凸角距离、四方向多边形间距和局部密度。特征协议冻结后再重跑同一嵌套门控诊断；
+在高精度门控出现非空移动前，不恢复长 PPO，也不对 M1_test7–8 消耗标注/求解资源。
+
+本轮新增 3 项两阶段测试，并与现有视觉树/森林测试合计 34 项通过。单元测试使用 Fake episode，
+不代表真实 OpenILT/Golden 已运行。
+
+## 2026-09-17 最新：全部点五分类随机森林对照
+
+沿用移动点参数搜索得到的随机森林参数，在同一份 `training.xlsx` 上重新纳入 `result=0`：共 1272 条、28 个布尔特征，类别 `-2/-1/0/+1/+2` 分别为 `84/12/993/76/107`。使用 500 棵树、`max_depth=None`、`min_samples_leaf=1`、`max_features=sqrt`、`class_weight=balanced_subsample`、`seed=0`，按六张版图进行留一验证。命令未传 `--drop-stay`：
+
+```powershell
+$env:PYTHONPATH='src;runs/_tree_runtime_py312;runs/_tree_support_py312'
+& 'C:/Users/雷神/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/python.exe' -B -m opc_agent.recipe_v2_vision_tree --input runs/v2-vision-dataset-004/training.xlsx --output runs/v2-vision-forest-004-all-points-tuned-001 --model-type forest --n-estimators 500 --max-depth none --min-samples-leaf 1 --max-features sqrt --class-weight balanced_subsample
+```
+
+折外五分类结果为 accuracy=47.33%、macro-F1=0.2289、balanced accuracy=27.45%；全预测 `0` 的基线分别为 78.07%、0.1754、20.00%。森林虽然提高了类别均衡指标，但误报严重：993 个真实 stay 点仅 539 个预测为 0，454 个被误判为移动；279 个真实移动点中 163 个被识别为某个非零类别。由此得到二阶段视角下的移动检测 recall=58.42%、precision=26.42%。因此该模型目前不能直接生成全点 Recipe；较高的五分类 macro-F1 也不能抵消大量假移动带来的 solver 风险。完整产物位于 `runs/v2-vision-forest-004-all-points-tuned-001/`，仍为 `diagnostic_only`，未做独立测试版图或 Golden solver 回放。这里沿用移动点上选出的参数，仅用于隔离“加入 stay 类”的影响，并非五分类参数最优性结论。
+
+本项目复现论文 *Intelligent OPC Engineer Assistant* 的两阶段思路。当前工作已从 PPO 链路验证转向 v2 坐标搜索及其 Recipe 的探索性决策树蒸馏：调整原始 target 上的 EPE 测量点，项目侧 recipe-aware OPC solver 在内部优化 mask，FRAG 暂时固定。PPO 续训暂停；Qwen v4 工作簿已经下载，新增独立五分类 Excel 决策树入口；搜索或决策树结果不能替代 PPO 验收。最新工作交接以文首 2026-09-17 记录为准。
+
+## 2026-09-17 最新：移动点随机森林参数敏感性实验
+
+在完全相同的 279 条非零样本和五折版图留一划分上完成固定网格：max_depth=
+`5/8/12/None`、min_samples_leaf=`1/2/5/10`、max_features=`sqrt/0.5/1.0`、
+class_weight=`balanced/balanced_subsample/None`，共 `4×4×3×3=144` 组；每组 500 棵树，
+bootstrap=True、seed=0、n_jobs=-1。没有随机拆点。结果位于
+`runs/v2-vision-forest-search-004-move-only-001/` 的 `grid_results.csv` 和 `search.json`。
+
+```bash
+export PYTHONPATH=src
+python -B -m opc_agent.recipe_v2_vision_forest_search \
+  --input runs/v2-vision-dataset-004/training.xlsx \
+  --output runs/v2-vision-forest-search-004-move-only-001 --n-estimators 500
+```
+
+按合并五折 Macro-F1 排名的最佳参数为 max_depth=None、min_samples_leaf=1、
+max_features=sqrt、class_weight=balanced_subsample；accuracy=38.71%、macro-F1=0.3227、
+balanced accuracy=33.08%，最差单版图 macro-F1=0.2594。该组合相对原固定森林的
+28.67%/0.2649/31.80% 有提升，也略高于多数类对照 accuracy=38.35%，但同一批折同时用于
+比较参数和报告最佳分数，存在选择偏差，不能当作独立泛化成绩。
+
+已用最佳参数在 `runs/v2-vision-forest-004-move-only-tuned-001/` 生成最终 500 树森林、
+forest.json/joblib、折外预测、报告和重要性。最终全样本拟合森林训练 macro-F1=0.6503；
+其 Gini 前五为 near_concave_corner（9.70%）、at_long_path_side（9.29%）、
+near_convex_corner（7.49%）、near_horizontal_edge（7.47%）、face_convex_corner（6.30%）。
+
+另行统计完全相同的 28 位特征向量：279 点只有 119 种向量，39 种向量内部存在多个标签，
+覆盖 185 点（66.31%）。若每种精确特征组合只能输出其多数标签，训练 accuracy 上限约 72.76%。
+明细保存在 `feature_label_conflicts.json`。这证明当前问题不仅是原森林参数欠拟合，也存在
+明显的特征到动作一对多冲突；该上限只针对确定性地按完整特征向量映射类别，不是所有模型的
+理论上限。训练模块与搜索冲突统计合计 31 项测试通过，源 Excel 未修改。
+
+## 2026-09-17 历史对照：移动点随机森林固定参数
+
+在同一入口新增 `--model-type forest --n-estimators 300`，默认仍为 tree。随机森林使用与
+上一版四分类树完全相同的 Excel SHA256、279 个非零样本、28 个 0/1 特征、五折按版图留一划分，
+不补入 stay 或失败点，不搜索超参数。固定 300 棵树、max_depth=5、min_samples_leaf=10、
+class_weight=balanced、random_state=0、bootstrap=True、max_features=sqrt、n_jobs=1。
+沿用下节本地隔离 CPU 环境，未调用 API/GPU。
+
+```bash
+export PYTHONPATH=src
+python -B -m opc_agent.recipe_v2_vision_tree \
+  --input runs/v2-vision-dataset-004/training.xlsx \
+  --output runs/v2-vision-forest-004-move-only-001 \
+  --drop-stay --model-type forest --n-estimators 300
+```
+
+已完成运行 `runs/v2-vision-forest-004-move-only-001/`。五折合并的验证指标：
+
+| 模型 | Accuracy | Macro-F1（四类） | Balanced accuracy |
+| --- | ---: | ---: | ---: |
+| 决策树 | 30.47% | 0.2725 | 32.11% |
+| 随机森林 | 28.67% | 0.2649 | 31.80% |
+| 各折训练集多数类对照 | 38.35% | 0.1386 | 25.00% |
+
+本组固定参数下随机森林没有改善决策树表现，不能据此排除其他参数或证明特征本身无效。
+Gini 前五为 type_V（11.02%）、face_convex_corner（7.74%）、near_ver_dir_has_polygon（7.32%）、
+on_horizontal_edge（6.58%）、near_horizontal_edge（6.49%）。置换重要性仍按各留出版图计算并保留负值，
+不能把训练模型内部的 Gini 排名当作泛化收益保证。
+
+森林产物包括 `random_forest.joblib`、`forest.json`、`metrics.json`、`report.md`、
+`feature_importance.csv/png`、`training_binary.csv` 和 `out_of_fold_predictions.csv`。
+不将某一子树当作整个森林，不导出单树规则图。forest.json 中子树内部类别编码恢复为真实
+移动类别，按各树的类别概率平均推理；`predict_forest` 与 sklearn 的预测已核对。
+训练模块测试命令 `python -B -m pytest -q tests/test_recipe_v2_vision_tree.py` 共 28 项通过，
+包含随机森林来源保持、折间隔离、无零类别、JSON 推理及模型重载检查。
+原始 Excel 哈希未变，旧模型结果保持不变；独立测试版图与 Golden 回放仍未执行。
+
+## 2026-09-17：删除不移动点后的四分类树
+
+按用户要求，训练入口新增 `--drop-stay`：先移除 `result=0` 的行，再在保留样本中删除含
+空值的特征列并将 true/false 转为 1/0。原始 Excel 与上一版五分类模型不改动。
+本次从 1272 条样本中排除 993 条 stay，保留 279 条、28 个特征；类别
+`-2/-1/+1/+2` 样本数为 `84/12/76/107`。M1_test3 全部是 stay，过滤后没有样本，
+其余五张版图参与留一版图验证，不将没有样本的 test3 计作验证折。
+
+```bash
+export PYTHONPATH=src
+python -B -m opc_agent.recipe_v2_vision_tree \
+  --input runs/v2-vision-dataset-004/training.xlsx \
+  --output runs/v2-vision-tree-004-move-only-001 --drop-stay
+```
+
+本地实际运行环境为 Windows CPU、Python 3.12.14、NumPy 2.3.5、scikit-learn 1.7.2，
+解释器为 `C:\Users\雷神\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe`。
+依赖从本项目 `runs/_tree_runtime_py312` 和 `runs/_tree_support_py312` 加载，不使用 AutoDL、
+项目 `.venv` 或 Anaconda；没有新增 API 费用或 GPU 运算。Windows 复现命令：
+
+```powershell
+$env:PYTHONPATH='src;runs/_tree_runtime_py312;runs/_tree_support_py312'
+& 'C:/Users/雷神/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/python.exe' -B -m opc_agent.recipe_v2_vision_tree --input runs/v2-vision-dataset-004/training.xlsx --output runs/v2-vision-tree-004-move-only-002 --drop-stay
+```
+
+输出目录须为空。树参数保持深度 5、叶节点至少 10 条、类别加权 balanced、seed=0。
+评估和置换重要性只使用固定四类；对照改为每折仅根据训练版图选取的多数移动类别，
+不读取留出版图标签选对照类别。本轮五折对照均选择 +2。
+四分类验证 accuracy=30.47%、macro-F1=0.2725、balanced accuracy=32.11%；
+多数类对照分别为 38.35%、0.1386、25.00%。不能将这组指标直接与包含 stay 的五分类结果比较，
+因为保留人群与类别集合已改变。
+
+本轮目录 `runs/v2-vision-tree-004-move-only-001` 保存模型、0/1 数据、树图、报告和新的重要性排名。
+Gini 前五为 far_vertical_edge（20.00%）、type_V（17.46%）、face_convex_corner（17.15%）、
+at_short_path_side（12.37%）、near_hor_dir_has_polygon（9.37%）。metrics.json 记录被移除点 ID、
+空样本版图、准确的运行环境及类别集合；tree.json/joblib 标记 `requires_external_move_selection=true`。
+这棵树只对已知需要移动的点预测移动档位，不能单独决定是否移动，也不能直接组装全点 Recipe。
+新增过滤顺序、全 stay 拒绝、无样本版图排除和四分类导出测试，训练模块 26 项测试通过。
+
+## 2026-09-17 历史对照：包含 stay 的五分类决策树
+
+当前输入是 `runs/v2-vision-dataset-004/training.xlsx` 的 `samples` 表，实际含 1272 条样本、
+28 个布尔特征，来自六张训练版图；工作簿未纳入的 34 个失败点不补入训练。
+样本类别 `-2/-1/0/+1/+2` 分别为 `84/12/993/76/107`，标签含义仍为法向 `-20/-10/0/+10/+20 nm`。
+原始 Excel 保持不变，不依赖尚未完整下载的图片或 annotations。
+
+入口 `src/opc_agent/recipe_v2_vision_tree.py` 使用标准库只读解析 OOXML，避免额外 Excel 读取依赖。
+只允许既有 28 列特征；每列出现空白、null、None、NaN 时整列删除，true/false 严格转成 1/0。
+本次 28 列均无空值，无需删列。`face_jog/on_jog_long_edge/on_jog_short_edge/at_long_path_end`
+四列恒为 false，保留并报告零重要性。epe_id 和 provenance 只供追溯与分组，不能进入 X。
+检查编号唯一、来源一一对应、result 与 normal_offset_nm 相符，并记录输入文件 SHA256。
+
+固定 `DecisionTreeClassifier(max_depth=5, min_samples_leaf=10, class_weight='balanced', random_state=0)`。
+参数预先固定，不根据验证结果搜索。先做六张训练版图内部的留一版图交叉验证，再用全部
+1272 条样本拟合最终共享树；没有使用独立 validation/test。报告 accuracy、固定五类 macro-F1、
+balanced accuracy、逐类 precision/recall/F1、混淆矩阵，并与全 stay 对照比较。
+
+```bash
+export PYTHONPATH=src
+python -B -m opc_agent.recipe_v2_vision_tree \
+  --input runs/v2-vision-dataset-004/training.xlsx \
+  --output runs/v2-vision-tree-004-001
+```
+
+输出目录必须为空。`--max-depth`、`--min-samples-leaf` 可修改树限制；修改参数属于另一次实验，
+应使用新目录。默认生成图；无 Matplotlib 的云端环境可用 `--no-plots` 只训练并导出数值结果。
+现有项目依赖已包含 scikit-learn；本地 Anaconda 存在 sklearn/NumPy 二进制冲突，本轮使用
+独立 Python 3.12 和 `runs/_tree_runtime_py312`、`runs/_tree_support_py312` 隔离依赖，不修改原环境。
+复现实验以 metrics.json 中 Python/NumPy/sklearn 版本为准；joblib 应用相同版本加载，
+跨环境可使用纯数据 `tree.json` 和模块中的 `predict_tree`（已与 sklearn 预测核对）。
+
+产物：`decision_tree.joblib`（模型及特征顺序）、`tree.json`（可执行节点）、`tree_rules.txt`、
+`training_binary.csv`（0/1 数据）、`out_of_fold_predictions.csv`、`metrics.json`、`report.md`、
+`feature_importance.csv`、`feature_importance.png`、`decision_tree.svg/png`。
+重要性 CSV 按最终全样本树的 Gini 重要性降序；同时提供六个留出版图上、每列 10 次置换的
+macro-F1 下降均值/标准差（版图等权、seed=0、负值不截断）。它衡量该模型的预测依赖，
+不是因果效应，相关类型/方向列会分摊或替代重要性。
+
+测试：`python -B -m pytest -q tests/test_recipe_v2_vision_tree.py`。
+该入口保持 `coordinate_search_not_ppo`、`diagnostic_only`；不接入旧九分类 PPO 教师门禁，
+不调用付费 API/OPC，不把分类成绩当作完整 Recipe 的 Golden 回放结果。
+
+本次已完成运行 `runs/v2-vision-tree-004-001/`，最终树深 5、25 个叶节点。
+训练集 accuracy=34.28%、macro-F1=0.2416；六图留一验证 accuracy=29.40%、macro-F1=0.1742、
+balanced accuracy=27.51%。全 stay 对照分别为 78.07%、0.1754、20.00%。类别加权提高了
+少数类召回，但总体 macro-F1 尚未超过 stay 对照，不能据此宣称蒸馏成功。
+Gini 排名前五为 face_convex_corner（19.11%）、far_vertical_edge（15.21%）、type_V（12.19%）、
+near_hor_dir_has_polygon（11.05%）、near_concave_corner（10.99%）。置换重要性同时保存在 CSV，
+两种排名含义不同；目前不自动按排名删除特征。21 项新增测试通过，源 Excel 哈希未变，
+joblib 重新加载和 tree.json 推理均与 sklearn 预测一致。尚未进行独立评估图或 Golden 回放。
+
+## 2026-09-16 历史交接：六图搜索完成，Recipe 已导出，决策树当时尚未训练
 
 ### 当前结论与证据位置
 
@@ -76,6 +496,194 @@ M1_test3 的 1040 个候选只有一个 mask 哈希，全部为 `no_strict_impro
 
 无需为确认已有收益重复六图搜索。尚未启动新训练、未修改 OpenILT、未提交 Git。下方 v1、三 seed、搜索待验证及决策树暂缓等内容为历史实现或阶段记录，与本节冲突时以本节为准。
 
+## 2026-09-16 Qwen 双图特征数据集（v4 已实现，全量待执行）
+
+### 当前 v4：几何确定字段、语义复核和 1306 点全量入口
+
+v3 云端 12 点试标为 11 ok、1 failed，但抽查发现 start/end 和邻近角点可能误判。
+v4（`appendix-a2-hybrid-v4`）使用项目现有 EPEControlPoint 分段和端点凹凸类型，
+由程序生成八列：`type_CV/CH/H/V`、`on_horizontal_edge/on_vertical_edge`、
+`on_start_corner_seg/on_end_corner_seg`。起止端按顺时针重排，当前分段端点实际连接原始角点
+才属于对应角点段；短边两端均为角点时两个字段均可为 true。这是项目明确的混合标注协议，
+不是声称论文使用了相同的程序规则。其余 20 列仍由视觉模型判断，near/far 不增设数值阈值。
+
+manifest 保存 `geometry_features/corner_evidence/geometry_evidence`；Prompt 只提供几何字段，
+不提供搜索动作、版图名称或最终质量。模型原值保存在 `model_features`，合并后的值在
+`parsed.features`，`feature_sources` 标明 geometry/vision。固定字段不一致，或分段端点
+为凸/凹角而模型没有将对应 near-corner 标为 true，均保存 `review_reasons` 并进入
+`needs_review`，即使全部字段都是布尔值也不进入训练表。只有分段端点没有角点时，
+仍由模型判断附近是否另有角点；不会自动填 false，也不会把所有可见角点都认作 near。
+
+v4 图1为 512×584，图2为 1024×584：原有 512 高图形区保持不变，底部增加独立图例。
+局部图的 `SEG START/SEG END` 表示蓝色分段箭头两端，不等同于原始边角点。
+红圈=当前 EPE 点，蓝箭头=顺时针分段方向，绿箭头=外法向正方向，橙框=裁剪窗口，黑色=target。
+绿色箭头不表示预测动作。图2仍为左 CONTEXT、右 FULL TARGET；灰色为未知区或概览留白。
+
+上传这三个代码文件后，在已有 OpenILT 和密钥环境变量的云端项目根目录直接执行全量：
+
+```bash
+export PYTHONPATH=src
+export PYTHONDONTWRITEBYTECODE=1
+python -B -m opc_agent.recipe_v2_vision run-all --dataset runs/v2-vision-dataset-004 --timeout-seconds 300
+```
+
+`run-all` 没有 manifest 时调用既有 prepare，从冻结搜索源重建全部 1306 点，不调用 solver。
+已有 manifest 时按当前版本续跑；不覆盖旧版 001/002/003。首轮每点最多一次 API 请求，
+总上限为 manifest 点数，不做同轮重试，单点失败继续下一个；400/401/403/404 立即停止。
+全部所选图片和缓存身份在首次 API 请求前检查。每点立即保存，正常结束或 Ctrl+C 后自动
+导出已完成 JSON/Excel 和 `annotation-summary.json`。准备阶段中断、manifest 尚未生成时，
+输出非空目录仍拒绝覆盖，应使用新目录。300 秒是 SDK 网络超时，不是严格墙钟上限。
+
+重复同一 run-all 命令会跳过 ok 和 needs_review，只请求 missing/failed；若要重试待复核项，
+使用 annotate 的 `--retry-uncertain`。改变图片/提示词/模型需要新目录，不混用旧缓存。
+按此前约 18 秒/点粗估，1306 点约 6.5 小时；空流和超时会延长，实际费用以平台计量为准。
+
+输出包括所有 PNG、原始响应、八列几何来源、复核原因、`training.json`、`training.xlsx` 和
+`annotation-summary.json`（各状态、各版图、未知特征、复核原因、每个失败点最后一次错误类型）。
+成功和失败响应均保存可用的流计数；不记录思考正文、密钥或 SDK 异常全文。仅外层唯一编号
+严格匹配且内部特征完整时在线规范化 JSON 包装；空对象仍 failed。导出会从原始响应重新
+计算合并和复核结论，拒绝被改写的 parsed/status，不会将纯布尔 needs_review 误收入训练集。
+
+本地本轮检查只有 27 个 v3 图片文件，无 SILICONFLOW_API_KEY 环境变量、无配置所需 OpenILT
+目录，未调用真实 API，也未完成 1306 点标注。CPU 合成测试不代表视觉准确率；ok 仅表示
+通过格式及当前语义规则，需保留人工抽查。全量结果的 complete 和质量尚待云端运行确认。
+
+### 历史 v3：顺时针修正、全图概览和离线格式恢复
+
+六图首批 60 点的云端结果为 41 ok、15 needs_review、4 failed；ok 仅指结构校验通过，不是视觉准确性验收。现已核对下载工件，独立离线格式恢复得到 43 ok、16 needs_review、1 failed（819 空对象）。报告 `runs/v2-vision-dataset-002-format-recovery.json` 保留源响应、源文件哈希、旧 Prompt 版本和规范化操作，原 annotations/training 文件未改动。旧 start/end 特征仍保留旧语义，不能混进 v3 训练集。
+
+v3 统一蓝色箭头为屏幕坐标（右 x、下 y）顺时针方向：根据外法线 n 构造切线 (-ny,nx)，行进时黑色实体在右侧，独立于原始顶点顺序；只调整显示，不改变 point_id、原始几何或搜索动作。之前 v2 的“原始遍历方向”与词典“顺时针”不一致，由本节修正。
+
+图1仍为 512×512 局部细节，图2为 1024×512 双面板：左侧上下文放大，右侧完整 target 等比例概览；均标同一测量点，右侧橙框指示上下文范围。near/far 在左侧上下文范围内作定性判断；全图用于路径连续性/长短判断。这是项目协议，不是论文数值阈值。jog 必须看到连续台阶折转，单个直角不算；被截断或过小无法判断仍返回 null。分段箭头端点不自动等同于原始边角点。
+
+以下命令记录历史 v3 试标流程；当前代码执行请使用上方 v4 run-all 和新目录：
+
+```bash
+export PYTHONPATH=src
+export PYTHONDONTWRITEBYTECODE=1
+python -B -m opc_agent.recipe_v2_vision prepare --output runs/v2-vision-dataset-003
+python -B -m opc_agent.recipe_v2_vision annotate \
+  --dataset runs/v2-vision-dataset-003 \
+  --point-ids 0,242,450,457,710,711,715,817,819,821,1060,1068 \
+  --limit 12 --retries 0 --timeout-seconds 300
+python -B -m opc_agent.recipe_v2_vision export --dataset runs/v2-vision-dataset-003
+```
+
+这 12 点覆盖六图的完整、未知、格式错误与空响应样例，每次最多 12 个请求；既有完成项跳过。先对照截图审核实际特征，不仅看 ok 数量。新图片/Prompt 需新目录，旧图片 manifest 缺少 v3 visual_protocol 时拒绝标注，不能复用旧图硬套新 Prompt。裁图仍从完整源 run 重建，不重新执行搜索；真实 v3 标注待云端验证。
+
+独立格式恢复（无 API、无需下载全部图片）：
+
+```bash
+python -B -m opc_agent.recipe_v2_vision recover \
+  --dataset runs/v2-vision-dataset-002 \
+  --output runs/v2-vision-dataset-002-format-recovery.json
+```
+
+仅允许外层唯一键严格匹配该点编号、内部是完整特征字典或完整规范响应；空对象、错编号、额外字段仍拒绝。布尔/未知原值不变，缺少的未知列表只从已有 null 派生。报告必须放在源目录外且不得覆盖已有文件。恢复不会更新旧训练 JSON/Excel，也不会消除语义不确定性。
+
+当前允许使用硅基流动 Qwen 做独立的探索性混合标注。下方“MLLM 暂缓”属于历史状态，以本节为准。本入口不训练决策树、不改变旧 accepted 教师门禁。
+
+### 云端文件与准备
+
+在包含 src/docs/runs 的 opc_agent 项目根目录运行。上传修改的代码、`docs/v2_search_20260915_recipes.json`，以及源目录 `runs/20260915T014128Z-v2-search-5697a08c/` 的 `recipe-v2-search.json`、`config.snapshot.yaml`、六图 `<layout>/seed-0/coordinate/result.json`。不需要 candidates.jsonl。保留原先锁定且 tracked diff 干净的 OpenILT clone 和 GLP。
+
+沿用现有云端环境与安装方式 `python -m pip install -e .`。项目固定 `openai==1.35.7`，现显式锁定其兼容传递依赖 `httpx==0.27.2`；旧环境需更新此依赖。HTTPX 0.28 移除了 `proxies` 参数，与该旧版 SDK 默认客户端构造不兼容。若出现 `unexpected keyword argument 'proxies'`，在已激活的项目虚拟环境执行 `python -m pip install "httpx==0.27.2"`，再执行 `python -m pip check`。该错误发生在客户端初始化，尚未发出 API 请求。
+
+可用假密钥离线验证构造（不请求网络、不验证真实密钥）：`python -B -c "from openai import OpenAI; c=OpenAI(api_key='offline-check', base_url='https://api.siliconflow.cn/v1'); c.close(); print('client init OK')"`。通过后继续 annotate，不需要重建图片。Excel 由标准库 OOXML 写出，无需 Office/openpyxl。裁图不调用 OPC/PPO，不创建 CUDA solver，但上游几何模块可能导入已有 OpenILT 依赖。
+
+### 1. 裁出全部点，不需要密钥
+
+```bash
+export PYTHONPATH=src
+export PYTHONDONTWRITEBYTECODE=1
+python -m opc_agent.recipe_v2_vision prepare \
+  --labels docs/v2_search_20260915_recipes.json \
+  --source-run runs/20260915T014128Z-v2-search-5697a08c \
+  --output runs/v2-vision-dataset-004
+```
+
+核对源总表 SHA256、完整 point_id、源动作、Recipe 哈希、最终回放标记；从源快照重建原始 target 和分段，不重新搜索。预期 1306 点、2612 张 PNG。默认局部窗口 128×128、上下文窗口 512×512（栅格坐标范围）；v4 输出尺寸及图例见上节。这是项目输入设计，不是论文超参数。用 `--local-window`、`--context-window` 调整，在试标后冻结。
+
+如果云端路径不同，在 prepare 命令后添加 `--openilt-dir /你的路径/OpenILT --iccad13-dir /你的路径/OpenILT/benchmark/ICCAD2013`，只覆盖数据路径，不修改源分段配置。输出目录须为空；裁图中断后使用新目录重建。
+
+图片黑色为 target，白色为背景，灰色为版图外未知区域。红圈中心是测量点，v3 蓝色箭头为顺时针方向，绿箭头为外法线。保持 raster 右 +x、下 +y。没有最终 mask 或搜索动作信息；无法判断时保留未知，start/end 使用 v3 顺时针协议。
+
+### 2. 密钥与模型在哪里设置
+
+只通过进程环境变量 `SILICONFLOW_API_KEY` 注入密钥，不写 Python/YAML/README/.env。Bash 隐藏输入（粘贴后回车）：
+
+```bash
+read -rsp 'SiliconFlow API key: ' SILICONFLOW_API_KEY
+export SILICONFLOW_API_KEY
+printf '\n'
+```
+
+默认模型 `Qwen/Qwen3.8-27B`，端点 `https://api.siliconflow.cn/v1`。该模型在硅基流动模型页标为原生视觉语言模型；本入口显式使用两张 `detail=high` 图片、关闭思考模式、将最终 JSON 限制为 1024 token，并采用流式接收以避免长时间无首包。需要修改模型或端点时使用 annotate 的 `--model`、`--base-url`。本入口不读取旧 `configs/paper_repro.yaml` 的 qwen 模型字段。账户权限、多图和 JSON 模式仍需云端确认，失败不会静默换模型。
+
+### 3. 试标、续跑与导出
+
+```bash
+python -m opc_agent.recipe_v2_vision annotate \
+  --dataset runs/v2-vision-dataset-004 --limit 60
+python -m opc_agent.recipe_v2_vision export \
+  --dataset runs/v2-vision-dataset-004
+```
+
+每点一次请求两张图片，模型只判断 features。按版图轮转取样，正常前 60 点每图 10 点；不保证几何类别覆盖，需人工检查图片和标注。
+
+`--limit` 是本次 API 请求总上限，包含重试，不是保证成功的样本数。默认 60。每点最多重试 2 次（`--retries 0..5`），默认 SDK 网络超时 300 秒（`--timeout-seconds` 可调整，必须是有限正数），串行调用、SDK 自动重试关闭。该设置约束网络阶段等待，并非整个请求的严格墙钟上限。每次请求记录 elapsed_seconds 和 timeout_seconds，终端显示开始及结束耗时；实际成本以试标/平台计量为准。认证、权限、模型、参数错误（400/401/403/404）立即停止；其他失败记录后可续跑。
+
+如果双图请求在原来的 120 秒设置下超时，先测试一个点，不重试：
+
+```bash
+python -B -m opc_agent.recipe_v2_vision annotate \
+  --dataset runs/v2-vision-dataset-004 \
+  --limit 1 --retries 0 --timeout-seconds 300
+```
+
+超时和耗时属于传输诊断，不参与缓存身份；调整超时可继续使用原截图和成功缓存。失败项会重新尝试。此命令会发送最多一次模型请求，是否成功及实际耗时仍需云端确认。
+
+确认小批质量后处理剩余点：
+
+```bash
+python -m opc_agent.recipe_v2_vision annotate \
+  --dataset runs/v2-vision-dataset-004 --limit 1306 --retries 0
+python -m opc_agent.recipe_v2_vision export \
+  --dataset runs/v2-vision-dataset-004
+```
+
+每点响应立即原子保存；重复同一命令跳过完成项，重新尝试失败项。`needs_review` 默认跳过，添加 `--retry-uncertain` 可重试未知项，不保证消除歧义。必要时重复有限预算命令；检查导出的 complete/review，不把请求数当完成数。Ctrl+C 可中断，已完成点保留；在途请求可能已经计费，无法保证恰好一次调用。
+
+缓存身份包含图片、模型、端点和完整提示词；变更后拒绝复用，须新建数据集目录。暂不提供人工改写已缓存响应的入口。
+
+### 提示词、接口与产物
+
+- `src/opc_agent/recipe_v2_vision_prompt.py`：完整中文 prompt 和 28 个布尔字段。附录 25 条目中的 types 展开为 CV/CH/H/V 四列。near/far、long/short 保留视觉定性含义，不计算阈值；原文 `far_ver_dir_has_polygon` 的解释写 no、名称写 has，本协议显式按 has 肯定含义处理。v2 Prompt 为 start/end 角点段补充了原始边遍历箭头，避免模型从无方向静态图猜测该字段。
+- `src/opc_agent/qwen.py::SiliconFlowQwen.extract_point_features(image_paths, prompt)`：复用客户端，一次两张 Base64 图片，返回原始文本。默认网络超时 300 秒，构造函数支持 timeout_seconds，重试由入口控制。
+- `src/opc_agent/recipe_v2_vision.py`：prepare、annotate、export、recover、run-all 五个子命令。
+- `manifest.json`：全点来源、point_id、坐标、动作及图像/GLP/源配置/标签哈希；内容哈希防止无意修改后复用缓存。
+- `feature_dictionary.json`：制作时的特征词典；`annotations/*.json`：每点完整 prompt、原始响应、模型、请求身份、失败类型。不记录密钥和 SDK 异常全文。流式无正文时仅记录安全诊断计数（流块数量、正文/思考字段字符数、结束原因），用于区分模型只输出思考字段和服务端空流。
+- `training.json`：samples 数组，每点 `epe_id/features/result`，元数据含教师来源、完整性和数量。
+- `training.xlsx`：samples（布尔特征，最后一列 result）、features（定义）、provenance（版图/point_id/Recipe）、review（缺失/失败/待复核）、summary。表头冻结、可筛选；与 JSON 从同一份合格记录生成。
+
+`result=-2/-1/0/1/2` 对应 `-20/-10/0/+10/+20 nm`，正方向是该点外法线。标签由程序从搜索结果合并，不由模型猜测，不是旧九分类动作。模型返回 true/false/null，未知字段必须列在 uncertain_features；漏字段、字符串布尔拒绝，v4 几何/语义矛盾保留为 needs_review。最终训练 samples 仅含完整布尔且无复核原因的记录；未解决项保留在 review。complete=false 不能宣称完成 1306 点数据集，API 成功不代表特征正确。
+
+后续树训练只取 features 为 X、result 为 y，按 provenance 的父版图分组；禁止把编号/来源/坐标放入 X。当前是 coordinate_search_not_ppo、diagnostic_only，未训练树、未验证分类质量和 Golden 回放。
+
+### 测试和未验证范围
+
+```bash
+export PYTHONPATH=src
+export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
+python -m pytest -q tests/test_recipe_v2_vision.py tests/test_recipe_v2_geometry_contract.py
+```
+
+本轮以上命令 48 项测试通过，覆盖源点匹配、动作映射、顺时针角点八列、几何冲突排除、
+响应包装规范化、图片预检、认证停止、流式中断计数和关闭、全量入口续跑及中断后导出、
+缓存防篡改和 JSON/Excel 一致性。局部/上下文合成图已渲染检查图例；无真实 API 调用。
+本地 Pydantic V2 发出两条项目既有 V1 用法弃用警告。真实 1306 点重建、Qwen 标注准确率、
+云端依赖和计费尚待验证；没有声称全量运行已经启动或完成。
+
 ## 历史 v1 实现与证据边界（当前 v2 进度见文首）
 
 - 当前主线版本为 `simpleopc-recipe-point-v1`，产物标签为 `ppo-recipe-point-v1`。
@@ -91,7 +699,7 @@ M1_test3 的 1040 个候选只有一个 mask 哈希，全部为 `no_strict_impro
 
 2026-09-16 更新：六图 seed=0 坐标搜索 `20260915T014128Z-v2-search-5697a08c` 已全部完成，5/6 图改善，J 降幅分别为 17.35%/14.70%/0%/10.62%/26.82%/21.71%，最终三项均不恶化、六图回放一致。详细协议、数值、调用预算、动作分布与解释边界见 [六图搜索结果登记](docs/v2_search_20260915_results.md)。已导出 [六图完整 Recipe 标签](docs/v2_search_20260915_recipes.json)，共 1306 点，仅为 diagnostic_only 坐标搜索教师候选，非 PPO/accepted 教师。允许下一阶段探索 v2 决策树，但不改变旧版教师验收门禁；全部点的输入特征尚需按冻结配置重建，现有 24 个可视化样例不等于完整训练集。当前未训练决策树。下方搜索未验证或决策树暂缓表述属于此前阶段记录，以此更新为准。
 
-最新决定：暂停云端运行，取消后续随机搜索，仅保留六张训练版图 M1_test1–6 的全零基线与单种子坐标搜索，配置 `search.seeds: [0]`，入口拒绝其他种子设置以避免误用旧预算。下方多种子、两方法预算与无续跑说明为历史版本，以本段为准。当前版本 `coordinate-only-resumable-v3` 每图构建一个环境；重启后每图重新建立一次基线与冻结 observation。全新运行预计 5224 次候选 + 6 次基线 + 6 次回放 = 5236 次调用。旧随机与 seed=1/2 工件保留但不再安排运行，底层随机分支仅供历史回归。
+六图历史决定：暂停当时的云端运行，取消后续随机搜索，仅保留六张训练版图 M1_test1–6 的全零基线与单种子坐标搜索，配置 `search.seeds: [0]`，入口拒绝其他种子设置以避免误用旧预算。下方多种子、两方法预算与无续跑说明为更早历史版本。已完成六图运行使用 `coordinate-only-resumable-v3`；2026-09-23 起当前入口升级为文首记录的 v4，但不改变六图历史工件。该六图全新运行预算为 5224 次候选 + 6 次基线 + 6 次回放 = 5236 次调用。旧随机与 seed=1/2 工件保留但不再安排运行，底层随机分支仅供历史回归。
 
 从已下载的旧 run 续跑时仅读取 seed=0；M1_test1 已完成的 968 个坐标候选可复用，其余五图共 4256 个候选，连同六图基线与回放预计新增 4268 次调用。按此前 M1_test1 的约 6.37 秒/次粗估约 7.6 小时（全新约 9.3 小时），版图差异会影响耗时，不是保证。seed=1 未完成日志不会继续，也不会删除。单 seed 用于六图探索，不支持搜索顺序稳定性结论。
 

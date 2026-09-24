@@ -384,12 +384,42 @@ def main(argv: list[str] | None = None) -> int:
     report_parser = subparsers.add_parser("report")
     search_parser = subparsers.add_parser("v2-search", help="全零基线与可续跑离散坐标搜索诊断")
     search_parser.add_argument("--config", type=Path, required=True)
+    search_parser.add_argument(
+        "--layouts",
+        nargs="+",
+        help="显式版图列表；默认使用配置中的训练六图",
+    )
+    search_parser.add_argument(
+        "--allow-validation-test-diagnostic",
+        action="store_true",
+        help="明确授权在 M1_test7–10 上使用自身 solver 反馈做逐图启发式诊断",
+    )
     report_parser.add_argument("--run-id", required=True)
     args = parser.parse_args(argv)
     if args.command == "report":
         report(args.run_id)
         return 0
     config = load_config(args.config)
+    if args.command == "v2-search":
+        if args.allow_validation_test_diagnostic:
+            expected = list(
+                config["data"]["validation_parents"] + config["data"]["test_parents"]
+            )
+            requested = list(args.layouts or [])
+            if requested != expected:
+                raise ValueError(
+                    "评估诊断必须显式按顺序提供全部 M1_test7–10，不能挑图"
+                )
+            config["search"]["scope"] = "validation_test_diagnostic"
+            config["search"]["layout_parents"] = requested
+            config["search"]["resume_from"] = None
+        elif args.layouts is not None:
+            if list(args.layouts) != list(config["data"]["train_parents"]):
+                raise ValueError(
+                    "未授权评估诊断时，--layouts 只能完整等于训练版图 M1_test1–6"
+                )
+            config["search"]["scope"] = "train_only"
+            config["search"]["layout_parents"] = list(args.layouts)
     identifier, root, store = init_run(config, args.command)
     try:
         if args.command == "v2-search":

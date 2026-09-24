@@ -1660,6 +1660,13 @@ class LocalEPEEpisode:
         return self._snapshot_solver_result(self._final_result)
 
     @property
+    def baseline_result(self) -> V2SolverResult:
+        """返回冻结全零 Recipe 的 solver 防御性快照，供独立指标审计使用。"""
+        if self._baseline_result is None:
+            raise RuntimeError("baseline solver result 尚未建立，请先 reset")
+        return self._snapshot_solver_result(self._baseline_result)
+
+    @property
     def final_recipe_sha256(self) -> str:
         """返回绑定版图、尺度、点几何、动作表与实际移动坐标的完整 Recipe 哈希。"""
         return self._recipe_hash_for_offsets(self.final_recipe_offsets_nm)

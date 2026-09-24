@@ -409,10 +409,11 @@ def _build_episode(
     layout_parent: str,
     *,
     shuffle_points: bool,
+    require_layout_contract: bool = True,
 ) -> Tuple[LocalEPEEpisode, Tuple[str, ...]]:
-    """为一张冻结 train 版图建立独立 terminal episode。"""
+    """为一张冻结版图建立独立 terminal episode，并按调用方要求核对逐图 contract。"""
     solver, evaluator, verified_fields = _build_v2_openilt_solver_and_evaluator(
-        config, layout_parent, require_layout_contract=True
+        config, layout_parent, require_layout_contract=require_layout_contract
     )
     recipe = config["recipe_v2"]
     episode = LocalEPEEpisode(

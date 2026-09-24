@@ -16,7 +16,11 @@ import yaml
 
 import opc_agent.recipe_v2_runner as runner_module
 import opc_agent.recipe_v2_small_train as small_train_module
-from opc_agent.recipe_v2_search import search_recipe, search_budget
+from opc_agent.recipe_v2_search import (
+    _validate_search_scope,
+    search_budget,
+    search_recipe,
+)
 from opc_agent.recipe_v2 import (
     FixedProbeGoldenEvaluator,
     FrozenObservationCache,
@@ -72,7 +76,14 @@ def test_search_budget_monotonicity_and_replay(method, tmp_path):
 
     _, episode = _episode(EPE_TERMINAL_PROTOCOL, patch_size=128,
                           action_offsets_nm=(-10, 0, 10))
-    result = search_recipe(episode, method, 0, 4, tmp_path / method)
+    result = search_recipe(
+        episode,
+        method,
+        0,
+        4,
+        tmp_path / method,
+        save_baseline_artifacts=True,
+    )
     assert result["candidate_calls"] == 4
     assert result["final_replay_equal"]
     assert result["best"]["j"] <= result["baseline"]["j"]
@@ -84,6 +95,10 @@ def test_search_budget_monotonicity_and_replay(method, tmp_path):
     assert losses == sorted(losses, reverse=True)
     assert all(result["best"]["metrics"][key] <= result["baseline"]["metrics"][key]
                for key in ("l2", "epe", "pvb"))
+    assert (tmp_path / method / "baseline-mask.png").is_file()
+    assert (tmp_path / method / "baseline-printed.png").is_file()
+    assert len(result["baseline_artifacts"]["printed_sha256"]) == 64
+    assert len(result["final_artifacts"]["final_printed"]["sha256"]) == 64
 
 
 def test_search_does_not_start_partial_coordinate_group(tmp_path):
@@ -138,11 +153,30 @@ def test_search_config_covers_train_six_only():
     config = yaml.safe_load((Path(__file__).parents[1] / "configs/recipe_ppo_v2.yaml").read_text(encoding="utf-8"))
     search = config["search"]
     assert search["layout_parents"] == config["data"]["train_parents"]
+    assert search["scope"] == "train_only"
     assert len(search["layout_parents"]) == 6
     assert search["seeds"] == [0]
     assert search["budget_policy"] == "one_full_coordinate_sweep"
     assert "candidate_budget" not in search
     assert not set(search["layout_parents"]) & set(config["data"]["validation_parents"] + config["data"]["test_parents"])
+
+
+def test_search_scope_requires_complete_explicit_validation_and_test_set():
+    """评估搜索必须明确切换scope并一次覆盖7–10，禁止挑图或混入训练图。"""
+    config = yaml.safe_load(
+        (Path(__file__).parents[1] / "configs/recipe_ppo_v2.yaml").read_text(
+            encoding="utf-8"
+        )
+    )
+    config["search"]["scope"] = "validation_test_diagnostic"
+    config["search"]["layout_parents"] = [
+        *config["data"]["validation_parents"],
+        *config["data"]["test_parents"],
+    ]
+    assert _validate_search_scope(config) == ("validation_test_diagnostic", False)
+    config["search"]["layout_parents"] = ["M1_test7", "M1_test10"]
+    with pytest.raises(ValueError, match="恰好覆盖 M1_test7–10"):
+        _validate_search_scope(config)
 
 
 @pytest.mark.parametrize("seeds", [[0, 1, 2], [1], []])

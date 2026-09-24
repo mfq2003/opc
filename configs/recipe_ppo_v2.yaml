@@ -185,6 +185,8 @@ acceptance:
 # 搜索护栏独立于正式 acceptance：三项指标不得超过固定全零基线。
 search:
   enabled: true
+  # 默认严格隔离验证/测试；仅显式 CLI 授权时改为 validation_test_diagnostic。
+  scope: train_only
   # 默认不自动启动续跑；需要时填旧 runs 目录，旧工件只读，新结果另存。
   resume_from: null
   layout_parents: [M1_test1, M1_test2, M1_test3, M1_test4, M1_test5, M1_test6]
